@@ -529,3 +529,116 @@ def test_launcher_one_click_duplicate_and_foreign_port_protection(tmp_path):
         )
     finally:
         foreign.close()
+
+
+def test_pipeline_customization_drives_real_execution(tmp_path):
+    client, store, headers = make_client(tmp_path)
+
+    # 1. Read default pipeline + built-in profiles
+    resp = client.get("/api/pipeline")
+    assert resp.status_code == 200
+    body = resp.json()
+    cfg = body["config"]
+    assert cfg["shared"]["profile_name"] == "balanced"
+    assert {p["id"] for p in body["profiles"]} >= {"balanced", "deep_learn", "strict_audit", "fast_ship"}
+
+    # 2. Custom prompts & personas genuinely inject into rendered prompts
+    cfg["shared"]["global_directives"] = "CUSTOM_GLOBAL_DIRECTIVE_XYZ"
+    cfg["gemini"]["system_persona"] = "CUSTOM_GEMINI_PERSONA_XYZ"
+    cfg["shared"]["study_guide_header"] = "CUSTOM_STUDY_HEADER_XYZ"
+    saved = client.put("/api/pipeline", json=cfg, headers=headers)
+    assert saved.status_code == 200
+    assert (tmp_path / "config" / "pipeline.yaml").is_file()
+
+    # Reject disabling BOTH models simultaneously
+    invalid_cfg = json.loads(json.dumps(cfg))
+    invalid_cfg["modules"]["gemini_enabled"] = False
+    invalid_cfg["modules"]["codex_enabled"] = False
+    assert client.put("/api/pipeline", json=invalid_cfg, headers=headers).status_code == 400
+
+    # Verify custom directives & persona show up in actual Gemini Stage 1 prompt
+    s1 = client.post(
+        "/api/sessions",
+        json={"task": "Test custom prompt propagation", "mode": "learn", "auto_start_codex": False},
+        headers=headers,
+    ).json()
+    prompt_g = s1["next_action"]["pending_gemini"][0]["prompt"]
+    assert "CUSTOM_GLOBAL_DIRECTIVE_XYZ" in prompt_g
+    assert "CUSTOM_GEMINI_PERSONA_XYZ" in prompt_g
+    assert len(s1["nodes"]) == 12
+    assert set(s1["nodes"]) >= {
+        "input_dispatch", "gemini_propose", "codex_propose",
+        "division_gate", "writelock_sandbox", "final_delivery",
+    }
+
+    # 3. Disable Gemini + skip Stage 2 + auto-decide Stage 3 + skip Stage 5 -> Codex solo auto-completes!
+    solo_cfg = json.loads(json.dumps(cfg))
+    solo_cfg["modules"]["gemini_enabled"] = False
+    solo_cfg["modules"]["codex_enabled"] = True
+    solo_cfg["stages"]["enable_critique"] = False
+    solo_cfg["stages"]["require_user_decision"] = False
+    solo_cfg["stages"]["default_winner"] = "codex"
+    solo_cfg["stages"]["enable_mutual_review"] = False
+    assert client.put("/api/pipeline", json=solo_cfg, headers=headers).status_code == 200
+
+    solo = client.post(
+        "/api/sessions",
+        json={"task": "Fast solo codex study note", "mode": "learn", "auto_start_codex": True},
+        headers=headers,
+    ).json()
+    assert solo["stage"] == "completed"
+    assert solo["nodes"]["gemini_propose"]["status"] == "skipped"
+    assert solo["nodes"]["codex_propose"]["status"] == "completed"
+    assert solo["nodes"]["codex_exec"]["status"] == "completed"
+    assert solo["nodes"]["final_delivery"]["status"] == "completed"
+    guide = client.get(f"/api/sessions/{solo['id']}/study-guide").json()
+    assert "CUSTOM_STUDY_HEADER_XYZ" in guide["markdown"]
+
+    # 4. Apply built-in profile & reset
+    fast = client.post("/api/pipeline/apply-profile", json={"profile_id": "fast_ship"}, headers=headers)
+    assert fast.status_code == 200
+    assert fast.json()["config"]["stages"]["enable_critique"] is False
+    reset = client.post("/api/pipeline/reset", headers=headers)
+    assert reset.status_code == 200
+    assert reset.json()["config"]["shared"]["profile_name"] == "balanced"
+
+
+def test_module_control_individual_and_start_all(tmp_path):
+    client, _, headers = make_client(tmp_path)
+
+    # List all 6 modules
+    snap = client.get("/api/modules").json()
+    mod_ids = {m["id"] for m in snap["modules"]}
+    assert mod_ids == {
+        "web_kernel", "antigravity_bridge", "codex_engine",
+        "mcp_bridge", "sandbox_guard", "storage_workspace",
+    }
+    assert snap["summary"]["total"] == 6
+
+    # CSRF enforced on module mutations
+    assert client.post("/api/modules/start-all").status_code == 403
+    assert client.post("/api/modules/codex_engine/toggle", json={"enabled": False}).status_code == 403
+
+    # Individual toggle off -> Codex shows stopped; turning off Gemini too is blocked (400)
+    off = client.post("/api/modules/codex_engine/toggle", json={"enabled": False}, headers=headers)
+    assert off.status_code == 200
+    codex_m = next(m for m in off.json()["snapshot"]["modules"] if m["id"] == "codex_engine")
+    assert codex_m["enabled"] is False
+    assert codex_m["status"] == "stopped"
+    assert client.post("/api/modules/antigravity_bridge/toggle", json={"enabled": False}, headers=headers).status_code == 400
+
+    # Individual probe action on sandbox_guard & codex_engine
+    sb = client.post("/api/modules/sandbox_guard/action", json={"action": "probe"}, headers=headers)
+    assert sb.status_code == 200
+    assert sb.json()["result"]["ok"] is True
+
+    # Master 1-click start-all re-enables all modules and runs real probes (including real MCP stdio handshake!)
+    started = client.post("/api/modules/start-all", json={"focus_antigravity": False}, headers=headers)
+    assert started.status_code == 200
+    res = started.json()
+    assert res["ok"] is True
+    assert res["results"]["codex_engine"]["status"] == "running"
+    assert res["results"]["mcp_bridge"]["status"] == "running"
+    assert res["results"]["mcp_bridge"]["tools_count"] >= 16
+    assert res["results"]["sandbox_guard"]["status"] == "running"
+    assert res["snapshot"]["summary"]["stopped"] == 0

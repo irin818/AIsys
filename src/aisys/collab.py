@@ -34,6 +34,13 @@ from .backends import (
     default_backends,
 )
 from .config import Model, UniqueLoader
+from .pipeline_config import (
+    BUILTIN_PROFILES,
+    ModuleController,
+    PipelineConfig,
+    PipelineConfigStore,
+    safe_format,
+)
 from .process import redact
 from .workspace import (
     apply_edits,
@@ -487,12 +494,12 @@ def _repo_overview(workspace: Path, limit: int = 4000) -> str:
     return redact("\n".join(parts))[:limit]
 
 
-def _compile_study_guide(session: CollabSession, workspace: Path) -> str:
+def _compile_study_guide(session: CollabSession, workspace: Path, *, header_note: str = "") -> str:
     """Compile completed non-overlapping Markdown sections + cross-review notes into study-guide.md."""
     lines = [
         f"# {session.task.splitlines()[0][:80]}",
         "",
-        "> **模式**：双模型协作学习文档（Gemini + Codex）  ",
+        f"> **说明**：{header_note or '双模型协作学习文档（Gemini + Codex）'}  ",
         f"> **会话 ID**：`{session.id}`  ",
         f"> **采用方案**：{session.locked_plan.source if session.locked_plan else '—'}  ",
         "",
@@ -580,6 +587,13 @@ class CollabStore:
         self.instance_id = uuid4().hex
         self.started_at = time.time()
         self.inspector = BackendInspector(backends=backends)
+        self.pipeline_store = PipelineConfigStore(self.data)
+        self.modules = ModuleController(
+            data=self.data,
+            project_root=self.project_root,
+            pipeline_store=self.pipeline_store,
+            backends=backends,
+        )
 
         self._lock = threading.Lock()
         self._active_codex_sessions: set[str] = set()
@@ -590,6 +604,281 @@ class CollabStore:
         self._watcher_thread: threading.Thread | None = None
         self._fingerprints: dict[str, str] = {}
         self._shutdown_callback = None
+
+    def get_pipeline_config(self) -> PipelineConfig:
+        return self.pipeline_store.load()
+
+    def save_pipeline_config(self, cfg: PipelineConfig | dict) -> PipelineConfig:
+        saved = self.pipeline_store.save(cfg)
+        self.publish("pipeline_changed", {"profile": saved.shared.profile_name})
+        return saved
+
+    def apply_pipeline_profile(self, profile_id: str) -> PipelineConfig:
+        saved = self.pipeline_store.apply_profile(profile_id)
+        self.publish("pipeline_changed", {"profile": saved.shared.profile_name})
+        return saved
+
+    def reset_pipeline_config(self) -> PipelineConfig:
+        saved = self.pipeline_store.reset()
+        self.publish("pipeline_changed", {"profile": saved.shared.profile_name})
+        return saved
+
+    def list_builtin_profiles(self) -> list[dict]:
+        return [
+            {"id": p["id"], "label": p["label"], "description": p["description"]}
+            for p in BUILTIN_PROFILES.values()
+        ]
+
+    def _aggregate_stats(self) -> dict:
+        sessions = self.list_sessions()
+        lock_allows = 0
+        lock_denies = 0
+        for item in sessions[:40]:
+            for ev in self.list_events(item["id"], limit=200):
+                if ev.get("event_type") == "writelock.audit":
+                    dec = (ev.get("detail") or {}).get("decision")
+                    if dec == "ALLOW":
+                        lock_allows += 1
+                    elif dec == "DENY":
+                        lock_denies += 1
+        return {
+            "sessions": len(sessions),
+            "completed": sum(1 for s in sessions if s["stage"] == "completed"),
+            "study_guides": sum(1 for s in sessions if s["has_study_guide"]),
+            "lock_allows": lock_allows,
+            "lock_denies": lock_denies,
+        }
+
+    def inspect_modules(self, *, host: str = "127.0.0.1", port: int = 8765, test_mode: bool = False) -> dict:
+        with self._sub_lock:
+            sse_clients = len(self._subscribers)
+        server_meta = {
+            "host": host,
+            "port": port,
+            "uptime_s": round(time.time() - self.started_at, 1),
+            "sse_clients": sse_clients,
+            "active_codex": self.active_sessions_count(),
+        }
+        return self.modules.inspect_all(
+            server_meta=server_meta,
+            stats=self._aggregate_stats(),
+            test_mode=test_mode,
+        )
+
+    def compute_node_statuses(self, s: CollabSession, events: list[dict], metrics: dict) -> dict[str, dict]:
+        """Compute live status of every individual Gemini, Codex, and Shared backend node."""
+        cfg = self.get_pipeline_config()
+        proc = self.get_active_process(s.id)
+        codex_stage = proc.get("stage") if proc else None
+
+        def _tok(usage: dict | None) -> int:
+            if not isinstance(usage, dict):
+                return 0
+            return int(usage.get("input_tokens", 0) or 0) + int(usage.get("output_tokens", 0) or 0)
+
+        # Gemini Stage 1
+        g_prop = s.proposals.get("gemini")
+        if not cfg.modules.gemini_enabled:
+            gp_st = "skipped"
+        elif g_prop:
+            gp_st = "completed"
+        elif s.stage == "proposing":
+            gp_st = "waiting"
+        else:
+            gp_st = "idle"
+
+        # Codex Stage 1
+        c_prop = s.proposals.get("codex")
+        if not cfg.modules.codex_enabled:
+            cp_st = "skipped"
+        elif c_prop:
+            cp_st = "completed"
+        elif s.stage == "proposing" and codex_stage == "proposing":
+            cp_st = "running"
+        elif s.stage == "proposing":
+            cp_st = "waiting"
+        else:
+            cp_st = "idle"
+
+        # Stage 2 Critique
+        g_ref = s.refined.get("gemini")
+        c_ref = s.refined.get("codex")
+        if not cfg.stages.enable_critique or not cfg.modules.gemini_enabled:
+            gc_st = "skipped" if not g_ref else "completed"
+        elif g_ref:
+            gc_st = "completed"
+        elif s.stage == "critiquing":
+            gc_st = "waiting"
+        else:
+            gc_st = "idle"
+
+        if not cfg.stages.enable_critique or not cfg.modules.codex_enabled:
+            cc_st = "skipped" if not c_ref else "completed"
+        elif c_ref:
+            cc_st = "completed"
+        elif s.stage == "critiquing" and codex_stage == "critiquing":
+            cc_st = "running"
+        elif s.stage == "critiquing":
+            cc_st = "waiting"
+        else:
+            cc_st = "idle"
+
+        # Shared Division & Decision Gate
+        if s.locked_plan:
+            gate_st = "completed"
+        elif s.stage in {"deciding", "merging"}:
+            gate_st = "waiting"
+        else:
+            gate_st = "idle"
+
+        # Stage 4 Executions (per model lane)
+        g_execs = [ex for ex in s.executions.values() if ex.owner == "gemini"]
+        c_execs = [ex for ex in s.executions.values() if ex.owner == "codex"]
+
+        def _exec_lane_status(items: list[TaskExecution], enabled: bool, is_codex: bool) -> str:
+            if not enabled:
+                return "skipped"
+            if not items:
+                return "completed" if s.stage in {"reviewing", "completed"} else "idle"
+            if any(x.status == "failed" for x in items):
+                return "failed"
+            if any(x.status == "running" for x in items) or (is_codex and codex_stage == "executing"):
+                return "running"
+            if any(x.status == "needs_fix" for x in items):
+                return "rework"
+            if all(x.status == "completed" for x in items):
+                return "completed"
+            return "waiting" if s.stage == "executing" else "idle"
+
+        ge_st = _exec_lane_status(g_execs, cfg.modules.gemini_enabled, False)
+        ce_st = _exec_lane_status(c_execs, cfg.modules.codex_enabled, True)
+
+        # Stage 5 Mutual Review (per model lane)
+        g_rev = s.reviews.get("gemini") or next(
+            (r for r in reversed(s.review_history) if r.reviewer == "gemini"), None
+        )
+        c_rev = s.reviews.get("codex") or next(
+            (r for r in reversed(s.review_history) if r.reviewer == "codex"), None
+        )
+        if not cfg.stages.enable_mutual_review or not cfg.modules.gemini_enabled:
+            gr_st = "skipped" if not g_rev else "completed"
+        elif s.stage == "reviewing" and "gemini" not in s.reviews and c_execs:
+            gr_st = "waiting"
+        elif g_rev:
+            gr_st = "completed" if g_rev.verdict == "pass" else "rework"
+        else:
+            gr_st = "idle"
+
+        if not cfg.stages.enable_mutual_review or not cfg.modules.codex_enabled:
+            cr_st = "skipped" if not c_rev else "completed"
+        elif s.stage == "reviewing" and codex_stage == "reviewing":
+            cr_st = "running"
+        elif s.stage == "reviewing" and "codex" not in s.reviews and g_execs:
+            cr_st = "waiting"
+        elif c_rev:
+            cr_st = "completed" if c_rev.verdict == "pass" else "rework"
+        else:
+            cr_st = "idle"
+
+        lock_events = [e for e in events if e.get("category") == "lock"]
+        lock_st = (
+            "failed" if metrics.get("lock_denies", 0) > 0 and s.stage == "failed"
+            else "completed" if metrics.get("lock_allows", 0) > 0
+            else "running" if s.locked_plan and s.stage == "executing"
+            else "idle"
+        )
+        deliv_st = "completed" if s.stage == "completed" else ("failed" if s.stage == "failed" else "idle")
+
+        return {
+            "input_dispatch": {
+                "id": "input_dispatch", "label": "共享意图分发与全局约束", "owner": "shared", "stage": 0,
+                "enabled": True, "status": "completed",
+                "summary": f"预设 {cfg.shared.profile_name} · 模式 {s.mode.upper()}",
+                "editor_section": "shared",
+            },
+            "gemini_propose": {
+                "id": "gemini_propose", "label": "Gemini 独立初案", "owner": "gemini", "stage": 1,
+                "enabled": cfg.modules.gemini_enabled, "status": gp_st,
+                "summary": g_prop.summary[:120] if g_prop else "等待 Antigravity (/aisys) 独立起草",
+                "editor_section": "gemini_propose",
+            },
+            "codex_propose": {
+                "id": "codex_propose", "label": "Codex 独立初案", "owner": "codex", "stage": 1,
+                "enabled": cfg.modules.codex_enabled, "status": cp_st,
+                "duration_s": c_prop.duration if c_prop else (proc.get("elapsed_s") if codex_stage == "proposing" else 0),
+                "tokens": _tok(c_prop.usage) if c_prop else 0,
+                "pid": proc.get("pid") if codex_stage == "proposing" else None,
+                "summary": c_prop.summary[:120] if c_prop else (proc.get("latest_event") if codex_stage == "proposing" else "隔离沙箱就绪"),
+                "editor_section": "codex_propose",
+            },
+            "gemini_critique": {
+                "id": "gemini_critique", "label": "Gemini 互审与分工", "owner": "gemini", "stage": 2,
+                "enabled": cfg.modules.gemini_enabled and cfg.stages.enable_critique, "status": gc_st,
+                "summary": g_ref.summary[:120] if g_ref else ("阶段 2 已跳过" if not cfg.stages.enable_critique else "审视 Codex 并给出互斥分工"),
+                "editor_section": "gemini_critique",
+            },
+            "codex_critique": {
+                "id": "codex_critique", "label": "Codex 互审与分工", "owner": "codex", "stage": 2,
+                "enabled": cfg.modules.codex_enabled and cfg.stages.enable_critique, "status": cc_st,
+                "duration_s": c_ref.duration if c_ref else (proc.get("elapsed_s") if codex_stage == "critiquing" else 0),
+                "tokens": _tok(c_ref.usage) if c_ref else 0,
+                "pid": proc.get("pid") if codex_stage == "critiquing" else None,
+                "summary": c_ref.summary[:120] if c_ref else ("阶段 2 已跳过" if not cfg.stages.enable_critique else "审视 Gemini 并给出互斥分工"),
+                "editor_section": "codex_critique",
+            },
+            "division_gate": {
+                "id": "division_gate", "label": "防重叠校验与拍板融合", "owner": "shared", "stage": 3,
+                "enabled": True, "status": gate_st,
+                "summary": (
+                    f"已锁定 {len(s.locked_plan.subtasks)} 项互斥任务（{len(s.locked_plan.division_check.waves)} 波次）"
+                    if s.locked_plan
+                    else ("人工拍板/融合微调" if cfg.stages.require_user_decision else f"自动锁定（默认 {cfg.stages.default_winner}）")
+                ),
+                "editor_section": "division_gate",
+            },
+            "gemini_exec": {
+                "id": "gemini_exec", "label": "Gemini 独占路径执行", "owner": "gemini", "stage": 4,
+                "enabled": cfg.modules.gemini_enabled, "status": ge_st,
+                "summary": f"{sum(1 for x in g_execs if x.status == 'completed')}/{len(g_execs)} 项完成" if g_execs else "无分配任务",
+                "editor_section": "gemini_exec",
+            },
+            "codex_exec": {
+                "id": "codex_exec", "label": "Codex 独占路径执行", "owner": "codex", "stage": 4,
+                "enabled": cfg.modules.codex_enabled, "status": ce_st,
+                "duration_s": round(sum(x.duration for x in c_execs), 2),
+                "tokens": sum(_tok(x.usage) for x in c_execs),
+                "pid": proc.get("pid") if codex_stage == "executing" else None,
+                "summary": f"{sum(1 for x in c_execs if x.status == 'completed')}/{len(c_execs)} 项完成" if c_execs else "无分配任务",
+                "editor_section": "codex_exec",
+            },
+            "writelock_sandbox": {
+                "id": "writelock_sandbox", "label": "硬写锁与 Seatbelt 沙箱", "owner": "shared", "stage": 4,
+                "enabled": True, "status": lock_st,
+                "summary": f"放行 {metrics.get('lock_allows', 0)} · 拦截 {metrics.get('lock_denies', 0)} · 校验 {len(lock_events)} 次",
+                "editor_section": "writelock_sandbox",
+            },
+            "gemini_review": {
+                "id": "gemini_review", "label": "Gemini 审查 Codex", "owner": "gemini", "stage": 5,
+                "enabled": cfg.modules.gemini_enabled and cfg.stages.enable_mutual_review, "status": gr_st,
+                "summary": f"第 {g_rev.round} 轮 · {g_rev.verdict.upper()}" if g_rev else ("互审已关闭" if not cfg.stages.enable_mutual_review else "等待审查 Codex 产出"),
+                "editor_section": "gemini_review",
+            },
+            "codex_review": {
+                "id": "codex_review", "label": "Codex 审查 Gemini", "owner": "codex", "stage": 5,
+                "enabled": cfg.modules.codex_enabled and cfg.stages.enable_mutual_review, "status": cr_st,
+                "duration_s": c_rev.duration if c_rev else (proc.get("elapsed_s") if codex_stage == "reviewing" else 0),
+                "tokens": _tok(c_rev.usage) if c_rev else 0,
+                "pid": proc.get("pid") if codex_stage == "reviewing" else None,
+                "summary": f"第 {c_rev.round} 轮 · {c_rev.verdict.upper()}" if c_rev else ("互审已关闭" if not cfg.stages.enable_mutual_review else "等待审查 Gemini 产出"),
+                "editor_section": "codex_review",
+            },
+            "final_delivery": {
+                "id": "final_delivery", "label": "最终汇编与交付归档", "owner": "shared", "stage": 5,
+                "enabled": True, "status": deliv_st,
+                "summary": s.final_summary or ("编译 Study Guide Markdown" if s.mode == "learn" else "汇总隔离工作区 Git Diff"),
+                "editor_section": "final_delivery",
+            },
+        }
 
     def _codex(self) -> CodexBackend:
         if self.backends is not None:
@@ -1059,6 +1348,7 @@ class CollabStore:
             checked = validate_project_path(project)
             project_path = Path(checked["path"])
 
+        cfg = self.get_pipeline_config()
         sid = str(uuid4())
         root = self.sessions_dir / sid
         root.mkdir(mode=0o700, parents=True)
@@ -1071,25 +1361,30 @@ class CollabStore:
             project_path=str(project_path) if project_path else None,
             source_commit=commit,
             stage="proposing",
+            max_review_rounds=cfg.stages.max_review_rounds,
         )
         self._save(session)
+        should_auto_codex = auto_start_codex and cfg.modules.codex_enabled and cfg.stages.auto_start_codex
         self.record_event(
             sid,
             category="engine",
             event_type="session.created",
             actor="user",
             stage="proposing",
-            summary=f"初始化 {mode.upper()} 协作会话与隔离工作区（HEAD={commit[:8] if commit else 'empty'}）",
+            summary=f"初始化 {mode.upper()} 协作会话（预设={cfg.shared.profile_name}，HEAD={commit[:8] if commit else 'empty'}）",
             detail={
                 "mode": mode,
+                "profile": cfg.shared.profile_name,
+                "gemini_enabled": cfg.modules.gemini_enabled,
+                "codex_enabled": cfg.modules.codex_enabled,
                 "task_chars": len(cleaned),
                 "has_project": bool(project_path),
                 "source_commit": commit,
-                "auto_start_codex": auto_start_codex,
+                "auto_start_codex": should_auto_codex,
             },
         )
         self.publish("sessions_changed", {"ids": [sid]})
-        if auto_start_codex:
+        if should_auto_codex:
             self.trigger_codex_async(sid)
         return self.get_session_view(sid)
 
@@ -1121,10 +1416,13 @@ class CollabStore:
         s = self._load(session_id)
         ws = self._workspace(session_id)
         events = self.list_events(session_id, limit=120)
+        metrics = self._session_metrics(s, events)
         data = s.model_dump(mode="json")
         data["codex_busy"] = self.is_codex_busy(session_id)
         data["active_process"] = self.get_active_process(session_id)
-        data["metrics"] = self._session_metrics(s, events)
+        data["metrics"] = metrics
+        data["nodes"] = self.compute_node_statuses(s, events, metrics)
+        data["pipeline_profile"] = self.get_pipeline_config().shared.profile_name
         data["events"] = events[-80:]
         data["workspace"] = str(ws)
         data["artifacts"] = artifacts(ws)
@@ -1135,13 +1433,14 @@ class CollabStore:
         """Return exact pending actions for Gemini (Antigravity), Codex, or User."""
         s = self._load(session_id)
         ws = self._workspace(session_id)
+        cfg = self.get_pipeline_config()
         codex_ready = False
         pending_gemini: list[dict] = []
         awaiting_user = False
 
         if s.stage == "proposing":
-            codex_ready = "codex" not in s.proposals
-            if "gemini" not in s.proposals:
+            codex_ready = cfg.modules.codex_enabled and "codex" not in s.proposals
+            if cfg.modules.gemini_enabled and "gemini" not in s.proposals:
                 pending_gemini.append({
                     "action": "propose",
                     "stage": "proposing",
@@ -1149,8 +1448,8 @@ class CollabStore:
                     "schema": PROPOSAL_SCHEMA,
                 })
         elif s.stage == "critiquing":
-            codex_ready = "codex" not in s.refined
-            if "gemini" not in s.refined:
+            codex_ready = cfg.modules.codex_enabled and "codex" not in s.refined
+            if cfg.modules.gemini_enabled and "gemini" not in s.refined and "gemini" in s.proposals and "codex" in s.proposals:
                 pending_gemini.append({
                     "action": "critique",
                     "stage": "critiquing",
@@ -1181,8 +1480,9 @@ class CollabStore:
                 if not deps_ok:
                     continue
                 if st.owner == "codex":
-                    codex_ready = True
-                else:
+                    if cfg.modules.codex_enabled:
+                        codex_ready = True
+                elif cfg.modules.gemini_enabled:
                     pending_gemini.append({
                         "action": "execute_subtask",
                         "stage": "executing",
@@ -1195,9 +1495,9 @@ class CollabStore:
         elif s.stage == "reviewing" and s.locked_plan:
             codex_owned = [st for st in s.locked_plan.subtasks if st.owner == "codex"]
             gemini_owned = [st for st in s.locked_plan.subtasks if st.owner == "gemini"]
-            if gemini_owned and "codex" not in s.reviews:
+            if cfg.modules.codex_enabled and gemini_owned and "codex" not in s.reviews:
                 codex_ready = True
-            if codex_owned and "gemini" not in s.reviews:
+            if cfg.modules.gemini_enabled and codex_owned and "gemini" not in s.reviews:
                 pending_gemini.append({
                     "action": "review_peer",
                     "stage": "reviewing",
@@ -1216,60 +1516,72 @@ class CollabStore:
             "pending_gemini": pending_gemini,
         }
 
-    # ---------- Prompt Builders ----------
+    # ---------- Prompt Builders (Driven Live by Editable PipelineConfig) ----------
+    def _compose_prompt(self, model: Owner, body: str) -> str:
+        cfg = self.get_pipeline_config()
+        persona = cfg.gemini.system_persona if model == "gemini" else cfg.codex.system_persona
+        shared = cfg.shared.global_directives.strip()
+        parts = [persona.strip()]
+        if shared:
+            parts.append(f"【共享全局约定】\n{shared}")
+        parts.append(body.strip())
+        return "\n\n".join(p for p in parts if p)
+
     def _proposal_prompt(self, s: CollabSession, ws: Path, model: Owner) -> str:
+        cfg = self.get_pipeline_config()
         mode_note = (
             "开发任务模式：请提出清晰的架构设计、关键边界与验证方案。"
             if s.mode == "dev"
             else "学习与研究模式：请设计循序渐进的知识框架、核心概念拆解与实操练习方向。"
         )
-        return (
-            f"你是双模型协作中的 {model.upper()}，当前处于【阶段 1：独立提出初案】。\n"
-            f"请独立思考并提出你的最佳预案（不要假设看到另一模型的回答）。\n"
-            f"{mode_note}\n"
-            f"任务/学习目标：\n{s.task}\n\n"
-            f"当前工作区概览：\n{_repo_overview(ws)}\n\n"
-            "请严格返回 JSON，包含 summary（简明摘要）、approach（完整方案 Markdown）、"
-            "strengths（核心优势列表）、risks（潜在风险或难点列表）。"
-        )
+        template = cfg.gemini.proposal_prompt if model == "gemini" else cfg.codex.proposal_prompt
+        body = safe_format(template, {
+            "model": model.upper(),
+            "mode_note": mode_note,
+            "task": s.task,
+            "repo_overview": _repo_overview(ws),
+        })
+        return self._compose_prompt(model, body)
 
     def _critique_prompt(
         self, s: CollabSession, ws: Path, model: Owner, own: Proposal, peer: Proposal
     ) -> str:
-        peer_name = "codex" if model == "gemini" else "gemini"
+        cfg = self.get_pipeline_config()
+        peer_name = "CODEX" if model == "gemini" else "GEMINI"
         path_rule = (
             "每个子任务的 owned_paths 必须是精确的相对文件路径（如 solution.py、tests/test_solution.py）。"
             if s.mode == "dev"
             else "每个子任务的 owned_paths 必须是互斥的 Markdown 章节文件（如 sections/01_concepts.md、sections/02_examples.md）。"
         )
-        return (
-            f"你是双模型协作中的 {model.upper()}，当前处于【阶段 2：交叉互审 + 升级方案 + 最优分工】。\n"
-            f"任务/学习目标：\n{s.task}\n\n"
-            f"你的初版方案：\n{own.model_dump_json(indent=2)}\n\n"
-            f"对方（{peer_name.upper()}）的初版方案：\n{peer.model_dump_json(indent=2)}\n\n"
-            "请完成以下工作：\n"
-            "1. 客观指出对方初案的不足或遗漏（critique_of_peer），以及你从对方吸收的优点（adopted_from_peer）。\n"
-            "2. 结合双方优点输出你的升级版完整方案（summary, approach）。\n"
-            "3. 设计一份【严格无重叠】的双模型最优任务分工表 subtasks[]：\n"
-            "   - 将最适合 Gemini（架构规划、概念解释、文档与审查）和最适合 Codex（编码实现、脚本示例、边界测试）的工作合理分配。\n"
-            f"   - {path_rule}\n"
-            "   - **硬性约束**：不同 owner（gemini vs codex）的子任务绝不能声明相同的 owned_paths，否则系统将判定冲突拒绝；有先后关系的任务通过 depends_on 声明，不得形成循环。\n"
-            "   - 控制在 2–6 个高内聚子任务，确保简洁清晰。"
-        )
+        template = cfg.gemini.critique_prompt if model == "gemini" else cfg.codex.critique_prompt
+        body = safe_format(template, {
+            "model": model.upper(),
+            "peer_name": peer_name,
+            "task": s.task,
+            "own_json": own.model_dump_json(indent=2),
+            "peer_json": peer.model_dump_json(indent=2),
+            "path_rule": path_rule,
+            "division_policy": cfg.shared.division_policy,
+            "max_subtasks": cfg.stages.max_subtasks,
+        })
+        return self._compose_prompt(model, body)
 
     def _merge_prompt(self, s: CollabSession) -> str:
-        return (
-            "当前处于【阶段 3：根据用户融合微调意见生成最终锁定分工】。\n"
-            f"任务/学习目标：\n{s.task}\n\n"
-            f"用户选择：{s.decision.choice if s.decision else 'merge'}，"
-            f"基础方案：{s.decision.base_model if s.decision else 'gemini'}\n"
-            f"用户融合微调指令：\n{s.decision.fusion_notes if s.decision else ''}\n\n"
-            f"Gemini 升级方案：\n{s.refined['gemini'].model_dump_json(indent=2) if 'gemini' in s.refined else '{}'}\n\n"
-            f"Codex 升级方案：\n{s.refined['codex'].model_dump_json(indent=2) if 'codex' in s.refined else '{}'}\n\n"
-            "请严格按照用户微调意见融合双方优点，输出最终 summary、approach 与严格无重叠的 subtasks[]（确保不同 owner 的 owned_paths 完全互斥、依赖无环）。"
-        )
+        cfg = self.get_pipeline_config()
+        body = safe_format(cfg.gemini.merge_prompt, {
+            "task": s.task,
+            "choice": s.decision.choice if s.decision else "merge",
+            "base_model": s.decision.base_model if s.decision else "gemini",
+            "fusion_notes": s.decision.fusion_notes if s.decision else "",
+            "gemini_refined": s.refined["gemini"].model_dump_json(indent=2) if "gemini" in s.refined else "{}",
+            "codex_refined": s.refined["codex"].model_dump_json(indent=2) if "codex" in s.refined else "{}",
+            "division_policy": cfg.shared.division_policy,
+            "max_subtasks": cfg.stages.max_subtasks,
+        })
+        return self._compose_prompt("gemini", body)
 
     def _subtask_prompt(self, s: CollabSession, ws: Path, st: SubTask, feedback: str) -> str:
+        cfg = self.get_pipeline_config()
         existing_blocks = []
         for path in st.owned_paths:
             existing_blocks.append(f"--- {path} ---\n{read_context(ws, path, 6000)}")
@@ -1281,22 +1593,25 @@ class CollabStore:
                 for dp in dep_ex.owned_paths[:2]:
                     dep_blocks.append(f"  File {dp}:\n{read_context(ws, dp, 3000)}")
         fb_block = f"\n【对方交叉审查打回的修复意见（务必逐项修复）】\n{feedback}\n" if feedback else ""
-        return (
-            f"你是 {st.owner.upper()}，当前处于【阶段 4：分工协同执行】。\n"
-            f"总任务：\n{s.task}\n\n"
-            f"总体锁定方案：\n{s.locked_plan.summary if s.locked_plan else ''}\n\n"
-            f"你负责的专属子任务：{st.id} · {st.title}\n"
-            f"任务要求：{st.objective}\n"
-            f"验收标准：{st.acceptance}\n"
-            f"【硬性权限锁】你只允许写入以下独占路径（不得修改其他任务的文件）：{', '.join(st.owned_paths)}\n"
-            f"{fb_block}\n"
-            f"前置依赖产出：\n" + ("\n".join(dep_blocks) or "(无)") + "\n\n"
-            "你独占路径的当前内容：\n" + "\n".join(existing_blocks) + "\n\n"
-            "请返回完整 UTF-8 文件内容（files 数组，每个 path 必须属于你的 owned_paths）、简明 summary，decision 设为 none。"
-        )
+        template = cfg.gemini.subtask_prompt if st.owner == "gemini" else cfg.codex.subtask_prompt
+        body = safe_format(template, {
+            "owner": st.owner.upper(),
+            "task": s.task,
+            "locked_summary": s.locked_plan.summary if s.locked_plan else "",
+            "task_id": st.id,
+            "task_title": st.title,
+            "objective": st.objective,
+            "acceptance": st.acceptance,
+            "owned_paths": ", ".join(st.owned_paths),
+            "feedback_block": fb_block,
+            "dep_blocks": "\n".join(dep_blocks) or "(无)",
+            "existing_blocks": "\n".join(existing_blocks),
+        })
+        return self._compose_prompt(st.owner, body)
 
     def _mutual_review_prompt(self, s: CollabSession, ws: Path, reviewer: Owner, targets: list[SubTask]) -> str:
-        target_owner = "codex" if reviewer == "gemini" else "gemini"
+        cfg = self.get_pipeline_config()
+        target_owner = "CODEX" if reviewer == "gemini" else "GEMINI"
         blocks = []
         for st in targets:
             ex = s.executions.get(st.id)
@@ -1308,13 +1623,133 @@ class CollabStore:
             )
             for p in st.owned_paths:
                 blocks.append(f"--- 文件 {p} ---\n{read_context(ws, p, 8000)}")
-        return (
-            f"你是 {reviewer.upper()}，当前处于【阶段 5：双模型互相审查监督（第 {s.review_round} 轮）】。\n"
-            f"请独立严格审查对方（{target_owner.upper()}）完成的所有子任务产出，检查正确性、完整性、边界条件与与总方案的一致性。\n"
-            f"总任务：\n{s.task}\n\n"
-            + "\n".join(blocks) + "\n\n"
-            "如果全部达标，返回 verdict='pass' 且 fix_requests=[]；"
-            "如果发现实质缺陷或遗漏，返回 verdict='fail' 并在 fix_requests 中逐条指明 task_id 和具体可执行的 feedback。"
+        template = cfg.gemini.review_prompt if reviewer == "gemini" else cfg.codex.review_prompt
+        body = safe_format(template, {
+            "reviewer": reviewer.upper(),
+            "target_owner": target_owner,
+            "review_round": s.review_round,
+            "task": s.task,
+            "target_blocks": "\n".join(blocks),
+        })
+        return self._compose_prompt(reviewer, body)
+
+    # ---------- Dynamic Pipeline Stage Advancement (Obeys Live PipelineConfig) ----------
+    def _synthesize_direct_subtasks(self, s: CollabSession, cfg: PipelineConfig) -> list[SubTask]:
+        tasks: list[SubTask] = []
+        if cfg.modules.gemini_enabled and "gemini" in s.proposals:
+            path = "sections/01_gemini_core.md" if s.mode == "learn" else "gemini_part.md"
+            tasks.append(SubTask(
+                id="T1",
+                title="核心思路与结构化文档" if s.mode == "learn" else "核心架构与设计交付",
+                owner="gemini",
+                objective=s.proposals["gemini"].summary[:300],
+                owned_paths=[path],
+                acceptance="内容完整、清晰、无越界写入。",
+            ))
+        if cfg.modules.codex_enabled and "codex" in s.proposals:
+            path = "sections/02_codex_examples.md" if s.mode == "learn" else "solution.py"
+            tid = "T2" if tasks else "T1"
+            tasks.append(SubTask(
+                id=tid,
+                title="实战代码示例与避坑验证" if s.mode == "learn" else "核心代码实现与验证",
+                owner="codex",
+                objective=s.proposals["codex"].summary[:300],
+                owned_paths=[path],
+                acceptance="实现正确、可运行验证且无越界写入。",
+            ))
+        return tasks
+
+    def _advance_after_proposal(self, s: CollabSession) -> None:
+        cfg = self.get_pipeline_config()
+        need_g = cfg.modules.gemini_enabled
+        need_c = cfg.modules.codex_enabled
+        if (need_g and "gemini" not in s.proposals) or (need_c and "codex" not in s.proposals):
+            return
+        if cfg.stages.enable_critique and need_g and need_c:
+            s.stage = "critiquing"
+            return
+        # Stage 2 skipped (disabled by user or solo-model mode): synthesize conflict-free refined wrappers
+        subtasks = self._synthesize_direct_subtasks(s, cfg)
+        div = validate_division(subtasks)
+        for owner, prop in s.proposals.items():
+            if owner not in s.refined:
+                s.refined[owner] = RefinedProposal(
+                    model=owner,  # type: ignore[arg-type]
+                    critique_of_peer="阶段 2 交叉互审已按当前配置跳过。",
+                    adopted_from_peer="直接沿用阶段 1 初案生成零重叠分工。",
+                    summary=prop.summary,
+                    approach=prop.approach,
+                    subtasks=subtasks,
+                    division_check=div,
+                )
+        self._advance_after_critique(s)
+
+    def _advance_after_critique(self, s: CollabSession) -> None:
+        cfg = self.get_pipeline_config()
+        need_g = cfg.modules.gemini_enabled
+        need_c = cfg.modules.codex_enabled
+        if (need_g and "gemini" not in s.refined) or (need_c and "codex" not in s.refined):
+            return
+        if cfg.stages.require_user_decision:
+            s.stage = "deciding"
+            return
+        # Auto-select winner when manual decision gate is disabled
+        preferred = cfg.stages.default_winner
+        chosen_owner = preferred if preferred in s.refined and s.refined[preferred].division_check.valid else None
+        if not chosen_owner:
+            chosen_owner = next(
+                (m for m, ref in s.refined.items() if ref.division_check.valid),
+                None,
+            )
+        if not chosen_owner:
+            s.stage = "deciding"
+            return
+        chosen = s.refined[chosen_owner]
+        s.decision = UserDecision(
+            choice=chosen_owner,  # type: ignore[arg-type]
+            base_model=chosen_owner,  # type: ignore[arg-type]
+            fusion_notes="自动拍板模式（require_user_decision=false）",
+        )
+        self._lock_plan(
+            s,
+            LockedPlan(
+                source=chosen_owner,  # type: ignore[arg-type]
+                summary=chosen.summary,
+                approach=chosen.approach,
+                fusion_notes="",
+                subtasks=chosen.subtasks,
+                division_check=chosen.division_check,
+            ),
+        )
+
+    def _finalize_completed(self, s: CollabSession, ws: Path, summary_text: str) -> None:
+        cfg = self.get_pipeline_config()
+        if s.mode == "learn":
+            guide = _compile_study_guide(s, ws, header_note=cfg.shared.study_guide_header)
+            guide_out = self.sessions_dir / s.id / "study-guide.md"
+            write_atomic(guide_out, guide.encode("utf-8"), mode=0o600)
+            write_atomic(ws / "STUDY_GUIDE.md", guide.encode("utf-8"), mode=0o644)
+            s.study_guide_path = str(guide_out)
+            self.record_event(
+                s.id,
+                category="workspace",
+                event_type="study_guide.compiled",
+                actor="aisys",
+                stage="completed",
+                summary=f"已自动编译结构化 Markdown 学习文档（{len(guide)} 字符，含 {len(s.review_history)} 条互审记录）",
+                detail={"chars": len(guide), "reviews": len(s.review_history)},
+            )
+        prev = s.stage
+        s.final_summary = summary_text
+        s.stage = "completed"
+        self.record_event(
+            s.id,
+            category="engine",
+            event_type="stage.transition",
+            actor="aisys",
+            stage="completed",
+            summary=f"状态机跃迁：{prev} → completed（{s.final_summary}）",
+            detail={"from": prev, "to": "completed", "rounds": s.review_round},
         )
 
     # ---------- State Transitions (Gemini / User / Codex) ----------
@@ -1332,8 +1767,7 @@ class CollabStore:
             )
             s.proposals["gemini"] = prop
             prev_stage = s.stage
-            if "codex" in s.proposals:
-                s.stage = "critiquing"
+            self._advance_after_proposal(s)
             self._save(s)
         self.record_event(
             session_id,
@@ -1351,11 +1785,11 @@ class CollabStore:
                 event_type="stage.transition",
                 actor="aisys",
                 stage=s.stage,
-                summary=f"状态机跃迁：{prev_stage} → {s.stage}（双方首轮预案已齐备）",
+                summary=f"状态机跃迁：{prev_stage} → {s.stage}",
                 detail={"from": prev_stage, "to": s.stage},
             )
         self.publish("sessions_changed", {"ids": [session_id]})
-        if auto_codex:
+        if auto_codex and self.get_pipeline_config().modules.codex_enabled:
             self.trigger_codex_async(session_id)
         return self.get_session_view(session_id)
 
@@ -1377,8 +1811,7 @@ class CollabStore:
             )
             s.refined["gemini"] = ref
             prev_stage = s.stage
-            if "codex" in s.refined:
-                s.stage = "deciding"
+            self._advance_after_critique(s)
             self._save(s)
         self.record_event(
             session_id,
@@ -1610,7 +2043,7 @@ class CollabStore:
                 allowed=st.owned_paths,
             )
             check_out = ""
-            if st.check_argv:
+            if st.check_argv and self.get_pipeline_config().modules.sandbox_checks_enabled:
                 chk = run_check(st.check_argv, ws, 30)
                 check_out = redact((chk.stdout + "\n" + chk.stderr).strip())[:4000]
                 passed = not chk.issue and chk.code == 0
@@ -1718,6 +2151,13 @@ class CollabStore:
         if not s.locked_plan:
             return
         if all(ex.status == "completed" for ex in s.executions.values()):
+            cfg = self.get_pipeline_config()
+            if not cfg.stages.enable_mutual_review:
+                self._finalize_completed(
+                    s, ws,
+                    f"全部 {len(s.executions)} 项子任务已完成（阶段 5 互相审查按配置跳过）。",
+                )
+                return
             s.stage = "reviewing"
             s.reviews = {}
             self.record_event(
@@ -1729,16 +2169,16 @@ class CollabStore:
                 summary=f"状态机跃迁：executing → reviewing（全部 {len(s.executions)} 项子任务完成，启动第 {s.review_round} 轮交叉审查）",
                 detail={"from": "executing", "to": "reviewing", "round": s.review_round},
             )
-            # Auto-pass side if a model had 0 assigned subtasks to be audited
-            if not any(st.owner == "codex" for st in s.locked_plan.subtasks):
+            # Auto-pass side if a model had 0 assigned subtasks or reviewer is disabled
+            if not cfg.modules.gemini_enabled or not any(st.owner == "codex" for st in s.locked_plan.subtasks):
                 s.reviews["gemini"] = MutualReview(
                     reviewer="gemini", target_owner="codex", round=s.review_round,
-                    verdict="pass", summary="无 Codex 子任务需审查（自动跳过）。",
+                    verdict="pass", summary="无 Codex 子任务需审查或 Gemini 已关闭（自动跳过）。",
                 )
-            if not any(st.owner == "gemini" for st in s.locked_plan.subtasks):
+            if not cfg.modules.codex_enabled or not any(st.owner == "gemini" for st in s.locked_plan.subtasks):
                 s.reviews["codex"] = MutualReview(
                     reviewer="codex", target_owner="gemini", round=s.review_round,
-                    verdict="pass", summary="无 Gemini 子任务需审查（自动跳过）。",
+                    verdict="pass", summary="无 Gemini 子任务需审查或 Codex 已关闭（自动跳过）。",
                 )
             self._maybe_finalize_review_round(s, ws)
 
@@ -1783,35 +2223,11 @@ class CollabStore:
             )
             return
 
-        # Complete session & compile Structured Markdown Study Guide if learn mode!
-        if s.mode == "learn":
-            guide = _compile_study_guide(s, ws)
-            guide_out = self.sessions_dir / s.id / "study-guide.md"
-            write_atomic(guide_out, guide.encode("utf-8"), mode=0o600)
-            write_atomic(ws / "STUDY_GUIDE.md", guide.encode("utf-8"), mode=0o644)
-            s.study_guide_path = str(guide_out)
-            self.record_event(
-                s.id,
-                category="workspace",
-                event_type="study_guide.compiled",
-                actor="aisys",
-                stage="completed",
-                summary=f"已自动编译结构化 Markdown 学习文档（{len(guide)} 字符，含 {len(s.review_history)} 条互审记录）",
-                detail={"chars": len(guide), "reviews": len(s.review_history)},
-            )
-        s.final_summary = (
+        self._finalize_completed(
+            s,
+            ws,
             f"双模型协同与交叉审查已完成（共 {s.review_round} 轮审查，"
-            f"Gemini 审查：{g_rev.verdict}，Codex 审查：{c_rev.verdict}）。"
-        )
-        s.stage = "completed"
-        self.record_event(
-            s.id,
-            category="engine",
-            event_type="stage.transition",
-            actor="aisys",
-            stage="completed",
-            summary=f"状态机跃迁：reviewing → completed（{s.final_summary}）",
-            detail={"from": "reviewing", "to": "completed", "rounds": s.review_round},
+            f"Gemini 审查：{g_rev.verdict}，Codex 审查：{c_rev.verdict}）。",
         )
 
     # ---------- Automated Codex Driver ----------
@@ -1855,11 +2271,16 @@ class CollabStore:
         return self.get_session_view(session_id)
 
     def _step_codex_once(self, session_id: str) -> bool:
+        cfg = self.get_pipeline_config()
+        if not cfg.modules.codex_enabled:
+            return False
         s = self._load(session_id)
         ws = self._workspace(session_id)
         broker = self.sessions_dir / session_id / "provider" / "codex"
         broker.mkdir(mode=0o700, exist_ok=True)
         codex = self._codex()
+        codex_model = cfg.codex.model.strip() or None
+        codex_timeout = float(cfg.codex.timeout_s)
 
         def _call_run_json(*, prompt: str, schema: dict, timeout: float, stage: str, step_label: str):
             self._set_active_process(session_id, {
@@ -1878,12 +2299,14 @@ class CollabStore:
                 actor="codex",
                 stage=stage,
                 summary=f"调度 Codex 执行：{step_label}（prompt={len(prompt)} 字符，timeout={int(timeout)}s）",
-                detail={"step": step_label, "prompt_chars": len(prompt), "timeout_s": timeout},
+                detail={"step": step_label, "model": codex_model or "default", "prompt_chars": len(prompt), "timeout_s": timeout},
             )
             self.publish("sessions_changed", {"ids": [session_id]})
             handler = self._make_codex_stream_handler(session_id, stage=stage, step_label=step_label)
             try:
                 kwargs = {"prompt": prompt, "schema": schema, "cwd": broker, "timeout": timeout}
+                if codex_model and self._supports_kwarg(codex.run_json, "model"):
+                    kwargs["model"] = codex_model
                 if self._supports_kwarg(codex.run_json, "on_event"):
                     kwargs["on_event"] = handler
                 return codex.run_json(**kwargs)
@@ -1894,7 +2317,7 @@ class CollabStore:
         if s.stage == "proposing" and "codex" not in s.proposals:
             prompt = self._proposal_prompt(s, ws, "codex")
             res, data = _call_run_json(
-                prompt=prompt, schema=PROPOSAL_SCHEMA, timeout=180,
+                prompt=prompt, schema=PROPOSAL_SCHEMA, timeout=codex_timeout,
                 stage="proposing", step_label="阶段 1 独立初案",
             )
             with self._exclusive(session_id):
@@ -1922,8 +2345,7 @@ class CollabStore:
                     usage=res.usage,
                 )
                 prev_stage = s.stage
-                if "gemini" in s.proposals:
-                    s.stage = "critiquing"
+                self._advance_after_proposal(s)
                 self._save(s)
             self.record_event(
                 session_id, category="codex", event_type="codex.step.completed",
@@ -1935,7 +2357,7 @@ class CollabStore:
                 self.record_event(
                     session_id, category="engine", event_type="stage.transition",
                     actor="aisys", stage=s.stage,
-                    summary=f"状态机跃迁：{prev_stage} → {s.stage}（双方首轮预案已齐备）",
+                    summary=f"状态机跃迁：{prev_stage} → {s.stage}",
                     detail={"from": prev_stage, "to": s.stage},
                 )
             return True
@@ -1944,7 +2366,7 @@ class CollabStore:
         if s.stage == "critiquing" and "codex" not in s.refined and "gemini" in s.proposals and "codex" in s.proposals:
             prompt = self._critique_prompt(s, ws, "codex", s.proposals["codex"], s.proposals["gemini"])
             res, data = _call_run_json(
-                prompt=prompt, schema=REFINED_SCHEMA, timeout=240,
+                prompt=prompt, schema=REFINED_SCHEMA, timeout=max(codex_timeout, 180.0),
                 stage="critiquing", step_label="阶段 2 交叉互审与分工",
             )
             with self._exclusive(session_id):
@@ -1984,8 +2406,7 @@ class CollabStore:
                     usage=res.usage,
                 )
                 prev_stage = s.stage
-                if "gemini" in s.refined:
-                    s.stage = "deciding"
+                self._advance_after_critique(s)
                 self._save(s)
             self.record_event(
                 session_id, category="lock", event_type="division.validated",
@@ -2006,7 +2427,7 @@ class CollabStore:
                 self.record_event(
                     session_id, category="engine", event_type="stage.transition",
                     actor="aisys", stage=s.stage,
-                    summary=f"状态机跃迁：{prev_stage} → {s.stage}（等待你拍板或融合微调）",
+                    summary=f"状态机跃迁：{prev_stage} → {s.stage}",
                     detail={"from": prev_stage, "to": s.stage},
                 )
             return True
@@ -2053,12 +2474,13 @@ class CollabStore:
             agent = Agent(
                 role=f"Codex Executor ({ready_task.id})",
                 backend="codex",
+                model=codex_model,
                 instructions=ready_task.objective,
                 write_paths=list(ready_task.owned_paths),
             )
             handler = self._make_codex_stream_handler(session_id, stage="executing", step_label=step_label)
             try:
-                run_kwargs = {"prompt": prompt, "agent": agent, "cwd": broker, "timeout": 240}
+                run_kwargs = {"prompt": prompt, "agent": agent, "cwd": broker, "timeout": max(codex_timeout, 180.0)}
                 if self._supports_kwarg(codex.run, "on_event"):
                     run_kwargs["on_event"] = handler
                 res = codex.run(**run_kwargs)
@@ -2094,7 +2516,7 @@ class CollabStore:
                         allowed=ready_task.owned_paths,
                     )
                     check_out = ""
-                    if ready_task.check_argv:
+                    if ready_task.check_argv and cfg.modules.sandbox_checks_enabled:
                         chk = run_check(ready_task.check_argv, ws, 30)
                         check_out = redact((chk.stdout + "\n" + chk.stderr).strip())[:4000]
                         passed = not chk.issue and chk.code == 0
@@ -2139,7 +2561,7 @@ class CollabStore:
                 return False
             prompt = self._mutual_review_prompt(s, ws, "codex", gemini_tasks)
             res, data = _call_run_json(
-                prompt=prompt, schema=MUTUAL_REVIEW_SCHEMA, timeout=180,
+                prompt=prompt, schema=MUTUAL_REVIEW_SCHEMA, timeout=codex_timeout,
                 stage="reviewing", step_label=f"阶段 5 第 {s.review_round} 轮交叉审查 Gemini",
             )
             with self._exclusive(session_id):
@@ -2219,7 +2641,9 @@ class CollabStore:
         if s.study_guide_path and Path(s.study_guide_path).is_file():
             content = Path(s.study_guide_path).read_text(encoding="utf-8")
         else:
-            content = _compile_study_guide(s, ws)
+            content = _compile_study_guide(
+                s, ws, header_note=self.get_pipeline_config().shared.study_guide_header,
+            )
         return {
             "session_id": s.id,
             "path": s.study_guide_path or str(self.sessions_dir / s.id / "study-guide.md"),

@@ -3,8 +3,6 @@ import asyncio
 import json
 import os
 import secrets
-import subprocess
-import sys
 import threading
 import time
 import urllib.request
@@ -68,6 +66,22 @@ class GeminiSubmitBody(BaseModel):
 
 class ShutdownBody(BaseModel):
     confirm_active: bool = False
+
+
+class ApplyProfileBody(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=40)
+
+
+class ToggleModuleBody(BaseModel):
+    enabled: bool
+
+
+class ModuleActionBody(BaseModel):
+    action: Literal["start", "stop", "probe", "repair", "open"] = "probe"
+
+
+class StartAllModulesBody(BaseModel):
+    focus_antigravity: bool = False
 
 
 def create_app(
@@ -277,26 +291,81 @@ def create_app(
             )
         return guide
 
+    # ---------- Editable Backend Pipeline Config ----------
+    @app.get("/api/pipeline")
+    async def get_pipeline():
+        return {
+            "config": store.get_pipeline_config().model_dump(mode="json"),
+            "profiles": store.list_builtin_profiles(),
+        }
+
+    @app.put("/api/pipeline")
+    async def update_pipeline(payload: dict):
+        saved = store.save_pipeline_config(payload)
+        return {
+            "config": saved.model_dump(mode="json"),
+            "profiles": store.list_builtin_profiles(),
+        }
+
+    @app.post("/api/pipeline/apply-profile")
+    async def apply_profile(body: ApplyProfileBody):
+        saved = store.apply_pipeline_profile(body.profile_id)
+        return {
+            "config": saved.model_dump(mode="json"),
+            "profiles": store.list_builtin_profiles(),
+        }
+
+    @app.post("/api/pipeline/reset")
+    async def reset_pipeline():
+        saved = store.reset_pipeline_config()
+        return {
+            "config": saved.model_dump(mode="json"),
+            "profiles": store.list_builtin_profiles(),
+        }
+
+    # ---------- Individual & Master Module Control ----------
+    @app.get("/api/modules")
+    async def list_modules():
+        return store.inspect_modules(host=host, port=port, test_mode=allow_testserver)
+
+    @app.post("/api/modules/start-all")
+    async def start_all_modules(body: StartAllModulesBody | None = None):
+        opts = body or StartAllModulesBody()
+        res = store.modules.start_all(
+            focus_antigravity=opts.focus_antigravity,
+            test_mode=allow_testserver,
+        )
+        store.publish("modules_changed", {"action": "start_all"})
+        return {
+            **res,
+            "snapshot": store.inspect_modules(host=host, port=port, test_mode=allow_testserver),
+        }
+
+    @app.post("/api/modules/{module_id}/toggle")
+    async def toggle_module(module_id: str, body: ToggleModuleBody):
+        cfg = store.modules.toggle_module(module_id, body.enabled)
+        store.publish("modules_changed", {"module": module_id, "enabled": body.enabled})
+        return {
+            "config": cfg.model_dump(mode="json"),
+            "snapshot": store.inspect_modules(host=host, port=port, test_mode=allow_testserver),
+        }
+
+    @app.post("/api/modules/{module_id}/action")
+    async def module_action(module_id: str, body: ModuleActionBody):
+        res = store.modules.run_action(module_id, body.action, test_mode=allow_testserver)
+        store.publish("modules_changed", {"module": module_id, "action": body.action})
+        return {
+            "result": res,
+            "snapshot": store.inspect_modules(host=host, port=port, test_mode=allow_testserver),
+        }
+
     @app.post("/api/focus-antigravity")
     async def focus_antigravity():
-        candidates = [
-            Path("/Applications/Antigravity.app"),
-            Path("/Applications/Gemini.app"),
-        ]
-        found = next((p for p in candidates if p.exists()), None)
-        if allow_testserver:
-            return {"focused": False, "app": found.stem if found else None, "reason": "test_mode"}
-        if sys.platform != "darwin" or not found:
-            return {"focused": False, "app": None, "reason": "not_installed"}
-        try:
-            subprocess.Popen(
-                ["open", "-a", str(found)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return {"focused": True, "app": found.stem}
-        except OSError:
-            return {"focused": False, "app": found.stem, "reason": "launch_error"}
+        return store.modules.launch_antigravity(
+            copy_trigger=True,
+            focus_app=True,
+            test_mode=allow_testserver,
+        )
 
     @app.get("/api/events")
     async def event_stream(request: Request):
