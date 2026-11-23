@@ -51,6 +51,17 @@ macOS 沙箱测试核对了本地 Python 可运行，工作区外的样例文件
 | Test 7 & 8：审批、Google 交接返工、取消、关机确认与安全防护 | 验证缺失 `X-AIsys-Token` / 跨站 `Origin` / `Sec-Fetch-Site` / 非法 `Host` 均返回 `403`；敏感路径拒绝 `400`；未认证 Codex 显示 `installed`（非 `callable`）并拦截误启动；审批未传 `human_confirmed` 拒绝 `400`，确认后推进；活跃任务存在时关机返回 `409`，确认后安全停止。 | **通过** |
 | Test 9 & 10：兼容性回归与 Web ↔ CLI 状态一致性 | `python -m pytest -q`（34 项全过）、`ruff check src tests`、`compileall`、`pip check`、`pip wheel`、`node --check`（`app.js`/`graph.js`）与 68 个 DOM ID 静态检查全部通过；Web 修改保存的工作流与真实 Run `e07226a8` 在 `aisys validate` / `aisys show --json` 中读取状态完全一致。 | **通过** |
 
+## 极简 5 步双模型协作室验证 · 2026-11-24
+
+彻底移除复杂多页 IDE 与节点拖拽编辑器后，在隔离目录 `data/collab-e2e/` 与自动化测试中验证了完整 5 步双模型协作闭环：
+
+| 测试项 | 验证方式与真实观测证据 | 结果 |
+| --- | --- | --- |
+| 真实 5 步双模型学习闭环（含融合微调与互审返工） | Session `5a8f4636-41e4-4f20-a149-76e564e8d48e`（主题：Python 装饰器与 `functools.wraps`，`learn` 模式）：① Gemini 与真实 Codex (`input_tokens=14567`, `output_tokens=1623`) 各自独立提案 → ② 双方交叉互审并给出无重叠分工表（`division_check.valid=True`）→ ③ 融合微调锁定 2 个互斥章节（`T1`: Gemini `sections/01_mental_model.md`，`T2`: Codex `sections/02_examples_pitfalls.md`）→ ④ 各自在硬锁定路径内完成交付（真实 Codex 生成 4,669 字符带 `assert` 的示例与踩坑题）→ ⑤ 真实 Codex 在第 1 轮互审中真实检出 `T1` 遗漏闭包与近似展开 3 项细节并打回 → 系统聚合全部 3 条反馈仅令 `T1` 返工（保留 `T2` 已完成）→ 第 2 轮复审收口并自动生成 7,979 字符的结构化 `study-guide.md`（含完整两轮勘误记录）。 | **通过（真机）** |
+| 机械防重叠校验与写路径硬锁 | `tests/test_web.py` 验证跨模型共享路径（`跨模型所有权冲突`）、同模型并行写同一路径、循环依赖均在拍板/融合前硬拦截；执行期 Gemini 试图写入 Codex 的 `owned_paths` 返回 HTTP `400`。 | **通过** |
+| 一键启动、重复启动与外来端口保护 | 真实执行 `./AIsys.command`（含空格路径 `aisys studio spaces`）：健康检查通过、二次执行复用同一 PID、显式外来占用端口报错且不杀外来进程、默认端口占用自动回退空闲端口、`aisys stop` 优雅停止。 | **通过（真机）** |
+| 安全防护、兼容性回归与打包 | `pytest -q`（31 项全过）、`ruff check src tests`、`compileall`、`pip check`、`pip wheel`（验证仅打包极简 `index.html`/`styles.css`/`app.js`，无残留 `graph.js`）、`node --check`、30 个 DOM ID 完整性校验与 CSRF/Origin/Host 拦截全部通过。 | **通过** |
+
 ## 仍受限制的验证与边界
 
 - **内置浏览器截图渲染检查未完成**：尝试调用内置 `webview_browser` 对 `http://127.0.0.1:8765` 截图检查时，宿主环境返回 `ISOLATED_WORLD_UNAVAILABLE` 未能获取渲染快照；已完成 JS 语法检查、68 个 DOM ID 完整性校验及全量 HTTP/SSE/真实 Codex 端到端验证，建议你在 macOS 本地双击 `AIsys.command` 在 Safari/Chrome 中直观体验。

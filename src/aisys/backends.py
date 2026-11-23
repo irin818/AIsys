@@ -110,8 +110,17 @@ class CodexBackend:
             return BackendResult(status="auth", error="Codex requires an existing ChatGPT login")
         return BackendResult(status="ok")
 
-    def run(self, *, prompt: str, agent: Agent, cwd: Path, timeout: float,
-            session_id: str | None = None) -> BackendResult:
+    def _invoke(
+        self,
+        *,
+        prompt: str,
+        schema: dict,
+        cwd: Path,
+        timeout: float,
+        model: str | None = None,
+        reuse_session: bool = False,
+        session_id: str | None = None,
+    ) -> ProcessResult | BackendResult:
         start = time.monotonic()
         ready = self.health()
         if ready.status != "ok":
@@ -123,7 +132,7 @@ class CodexBackend:
         if not exe:
             return BackendResult(status="unavailable", error="Codex CLI is not on PATH")
         schema_path = cwd / "reply-schema.json"
-        write_atomic(schema_path, json.dumps(REPLY_SCHEMA).encode())
+        write_atomic(schema_path, json.dumps(schema).encode())
         cmd = [exe, "exec"]
         if session_id:
             cmd.append("resume")
@@ -145,20 +154,36 @@ class CodexBackend:
             "--disable", "apps", "--disable", "hooks",
             "--disable", "memories", "--disable", "request_permissions_tool",
         ])
-        if agent.model:
-            cmd.extend(["--model", agent.model])
-        if not agent.reuse_session:
+        if model:
+            cmd.extend(["--model", model])
+        if not reuse_session:
             cmd.append("--ephemeral")
         if session_id:
             cmd.append(str(UUID(session_id)))
-        result = run_process([*cmd, "-"], cwd, cli_env(), remaining, prompt)
-        return parse_events(result)
+        return run_process([*cmd, "-"], cwd, cli_env(), remaining, prompt)
+
+    def run(self, *, prompt: str, agent: Agent, cwd: Path, timeout: float,
+            session_id: str | None = None) -> BackendResult:
+        raw = self._invoke(
+            prompt=prompt, schema=REPLY_SCHEMA, cwd=cwd, timeout=timeout,
+            model=agent.model, reuse_session=agent.reuse_session, session_id=session_id,
+        )
+        if isinstance(raw, BackendResult):
+            return raw
+        return parse_events(raw)
+
+    def run_json(self, *, prompt: str, schema: dict, cwd: Path, timeout: float,
+                 model: str | None = None) -> tuple[BackendResult, dict | None]:
+        raw = self._invoke(prompt=prompt, schema=schema, cwd=cwd, timeout=timeout, model=model)
+        if isinstance(raw, BackendResult):
+            return raw, None
+        return parse_json_events(raw)
 
 
-def parse_events(result: ProcessResult) -> BackendResult:
+def _extract_codex_message(result: ProcessResult) -> tuple[BackendResult | None, str | None, dict]:
     common = {"duration": result.duration, "exit_code": result.code}
     if result.issue:
-        return BackendResult(status=result.issue, error=f"Codex process: {result.issue}", **common)
+        return BackendResult(status=result.issue, error=f"Codex process: {result.issue}", **common), None, common
     errors = [result.stderr]
     session_id = None
     final = None
@@ -197,6 +222,7 @@ def parse_events(result: ProcessResult) -> BackendResult:
                          if k in USAGE_FIELDS and type(v) is int and v >= 0}
         elif event_type in {"error", "turn.failed"}:
             errors.append(json.dumps(event))
+    meta = {**common, "session_id": session_id, "usage": usage}
     if result.code != 0 or not completed:
         text = "\n".join(errors).lower()
         if re.search(r"rate.limit|usage limit|quota|too many requests|\b429\b", text):
@@ -207,20 +233,39 @@ def parse_events(result: ProcessResult) -> BackendResult:
             status = "invalid"
         else:
             status = "failed"
-        return BackendResult(status=status, session_id=session_id, usage=usage,
-                             error=f"Codex run did not complete ({status}, exit {result.code})",
-                             **common)
+        return BackendResult(
+            status=status,
+            error=f"Codex run did not complete ({status}, exit {result.code})",
+            **meta,
+        ), None, meta
     if unexpected_tool:
-        return BackendResult(status="invalid", error="Codex reported a disallowed tool event", **common)
+        return BackendResult(status="invalid", error="Codex reported a disallowed tool event", **common), None, meta
+    return None, final, meta
+
+
+def parse_json_events(result: ProcessResult) -> tuple[BackendResult, dict | None]:
+    failure, final, meta = _extract_codex_message(result)
+    if failure is not None:
+        return failure, None
+    try:
+        parsed = json.loads(final or "")
+        if not isinstance(parsed, dict):
+            raise ValueError("expected a JSON object")
+    except ValueError:
+        return BackendResult(status="invalid", error="Codex response failed JSON parsing", **meta), None
+    return BackendResult(status="ok", **meta), parsed
+
+
+def parse_events(result: ProcessResult) -> BackendResult:
+    failure, final, meta = _extract_codex_message(result)
+    if failure is not None:
+        return failure
     try:
         reply = Reply.model_validate_json(final or "")
         reply.summary = redact(reply.summary)
     except ValueError:
-        return BackendResult(status="invalid", error="Codex response failed the reply schema",
-                             session_id=session_id, usage=usage, **common)
-    return BackendResult(
-        status="ok", reply=reply, session_id=session_id, usage=usage, **common,
-    )
+        return BackendResult(status="invalid", error="Codex response failed the reply schema", **meta)
+    return BackendResult(status="ok", reply=reply, **meta)
 
 
 def default_backends() -> dict[str, Backend]:

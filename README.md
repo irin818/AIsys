@@ -1,27 +1,33 @@
 # AIsys
 
-AIsys 是一套 macOS 本地多智能体工作流平台。支持通过根目录 `AIsys.command` 一键启动本地 Web 工作台（默认 `http://127.0.0.1:8765`），也保留完整 CLI、Textual 终端工作台与 MCP 接口；全部入口共享同一个 LangGraph 编排内核、YAML 声明式配置与 SQLite 持久化状态。
+AIsys 是一套面向 macOS 的 **Gemini (Antigravity) × Codex 极简双模型协作室**。双击根目录 `AIsys.command` 即可一键启动本地 Web 界面（默认 `http://127.0.0.1:8765`），只保留最核心的 **5 步双模型协同流程**，同时底层完整保留 LangGraph 编排、Codex CLI 自动执行、SQLite 持久化、Git 快照隔离与 macOS Seatbelt 沙箱。
 
-**接入现状** · Codex 已真实接通（支持 PATH 优先及 macOS ChatGPT.app 内置 CLI 自动发现）。Google 个人订阅禁止由第三方应用直接封装 `agy -p` 或无人值守轮询；现已通过 **Antigravity 主控 + 统一任务交换协议** 实现合规双模型协作，脱离 Antigravity 单独使用 Web/CLI/工作台时，Google 节点自动暂停并支持在 Web 交接面板或 CLI 中提交核阅结果。 [接入调查](docs/discovery.md) · [Antigravity 集成](docs/antigravity-integration.md)
+**核心协作流程（路线 1 · \$0 额外费用）**：
 
-## 一键启动 Web 工作台（推荐）
+1. **① 独立初案**：输入开发任务或学习主题，Gemini（Antigravity 主控）与 Codex 彼此隔离地各自分析并给出初版方案。
+2. **② 交叉互审 + 升级方案 + 无重叠分工**：双方互评对方初案、吸收优点并输出升级方案与结构化分工表，系统从代码层硬校验跨模型 `owned_paths` 绝对互斥且依赖无环。
+3. **③ 你的拍板（支持融合微调）**：在极简 Web 界面左右并排对比，一键选择「采用 Gemini 方案」「采用 Codex 方案」或填写一句「融合微调」意见。
+4. **④ 互斥协同执行**：锁定分工后，每个子任务由唯一 `owner` 执行，写入权限被底层硬锁死在各自独占的 `owned_paths`（代码文件或 Markdown 章节），从机制上杜绝任务重叠与文件互相覆盖。
+5. **⑤ 互相监督与交付**：Gemini 独立审查 Codex 的全部产出，Codex 独立审查 Gemini 的全部产出，有缺陷定点返工；学习模式自动汇编为**结构化 Markdown 学习文档**（`data/sessions/<id>/study-guide.md`，支持网页阅读与一键下载 `.md`），开发模式提供隔离工作区代码 Diff。
+
+[接入调查](docs/discovery.md) · [Antigravity 集成](docs/antigravity-integration.md) · [验证记录](docs/validation.md)
+
+## 一键启动（推荐）
 
 在 Finder 中直接双击项目根目录的 **`AIsys.command`**（或在终端运行 `./AIsys.command`）：
 
-1. 自动定位项目目录并检查 `.venv` 与依赖（已安装时不重复安装）。
-2. 检查本地是否已有已验证的 AIsys 实例在运行：若已运行直接打开浏览器，不重复启动；若端口被其他程序占用则**不终止该进程**并自动回退到空闲端口（或提示冲突）。
-3. 后台独立启动仅绑定 `127.0.0.1` 的 FastAPI 服务（默认 `http://127.0.0.1:8765`，可通过 `AISYS_PORT` 或 Web 设置更改），通过 `/api/health` 健康检查后自动打开浏览器。
-4. 关闭浏览器标签页或启动终端不会中断正在执行的工作流；可在 Web 左下角点击「停止服务」或运行 `aisys stop` 优雅停止。
-
-Web 工作台包含 **总览 Dashboard**（区分已安装/已认证/可调用/正在执行/受限/不可用/未验证的后端状态）、**任务中心**（SSE 实时监控、审批与 Google 交接、代码 Diff、队列与控制）、**可视化工作流编辑器**（拖拽节点与连线、条件路由与循环配置、与 YAML 双向实时同步）、**Agent 管理**（单后端多角色与模板库）、**统一日志中心** 及 **深色/浅色主题**。
-
-也可以在命令行直接管理 Web 服务：
+1. 自动定位项目目录并检查 `.venv` 与依赖（已安装时秒级跳过）。
+2. 通过 `data/server.json` + `/api/health` 核验本地是否已有运行中的 AIsys 实例：已运行则直接打开浏览器；若端口被其他程序占用则**不终止外来进程**并自动回退至空闲端口。
+3. 后台独立启动仅绑定 `127.0.0.1` 的 FastAPI 服务（带 Host/Origin/CSRF 保护与 SSE 实时同步），关闭浏览器或终端不中断任务；随时可在网页右上角点「停止」或运行 `aisys stop` 优雅关闭。
 
 ```sh
-aisys serve --open        # 启动并打开浏览器
-aisys status              # 检查本地服务是否运行
-aisys stop                # 优雅停止已验证的本地服务
+aisys serve --open        # 启动双模型协作室并打开浏览器
+aisys status              # 查看本地服务状态
+aisys stop                # 优雅停止本地服务
+aisys collab list         # 查看全部 5 步协作会话
 ```
+
+在 Antigravity 中打开本仓库后，工作区插件 `.agents/plugins/aisys-bridge/` 会自动提供 `aisys-driver` Skill 与 `aisys_collab_*` MCP 工具，直接说一句「使用 `aisys-driver` 开启双模型学习/开发：……」即可自动跑通全部 Gemini 与 Codex 接力步骤。
 
 ## 安装与 CLI 启动
 
@@ -123,13 +129,12 @@ aisys resume RUN_ID --accept --file response.txt
 
 | 职责 | 模块 |
 | --- | --- |
-| Workflow 与 Agent | `config.py` 校验配置（支持 `presets/` 与 `data/config/workflows/` 统一解析），`services.py` 提供统一业务服务层与 Agent 库 |
-| Web 与启动器 | `web_server.py`（FastAPI 仅绑定 `127.0.0.1` + CSRF/Origin/Host 防护 + SSE）、`web/` 零构建工作台与可视化编辑器、`AIsys.command` 一键启动 |
-| Orchestrator | `engine.py` 编译 LangGraph，负责条件路由、并行汇合、预算、人工中断和恢复 |
-| Exchange & MCP | `protocol.py` 定义统一任务交换信封/提交/审计，`mcp_server.py` 提供零依赖本地 stdio MCP |
-| Model Backend | `backends.py` 管理 Codex CLI（支持 macOS ChatGPT.app 内置回退与 `project_doc_max_bytes=0` 隔离）和 Google 可用性边界 |
-| Tool | `workspace.py` 处理快照、上下文、受限编辑和本地检查，`process.py` 限制子进程时间及输出量 |
-| State | `state.py` 冻结配置，保存 SQLite 检查点及外部执行记录，每个运行只允许一个驱动进程 |
+| 5 步双模型协作 | `collab.py` 实现独立提案、交叉互审、机械防重叠校验（`validate_division`）、融合微调、互斥写入执行、互相审查与 Markdown 学习文档汇编 |
+| Web 与启动器 | `web_server.py`（FastAPI 仅绑定 `127.0.0.1` + CSRF/Origin/Host 防护 + SSE）、`web/` 极简单页双模型协作室、`AIsys.command` 一键启动 |
+| Workflow 与编排 | `config.py` 校验 YAML（支持 `presets/` 与 `data/config/workflows/`），`engine.py` 编译 LangGraph 并保留完整 CLI/TUI 能力 |
+| Exchange & MCP | `protocol.py` 定义统一任务交换协议，`mcp_server.py` 提供零依赖本地 stdio MCP（含 `aisys_collab_*` 与 `aisys_*` 工具） |
+| Model Backend | `backends.py` 管理 Codex CLI（支持结构化 JSON 输出 `run_json`、macOS ChatGPT.app 内置回退与 `project_doc_max_bytes=0` 隔离）与 Google 合规边界 |
+| Tool & State | `workspace.py` 处理 Git 快照、路径白名单写入与 Seatbelt 沙箱检查，`state.py`/`process.py` 负责检查点与凭据脱敏 |
 
 模型通过 stdin 收到上下文，在独立的只读运行目录返回结构化结果。编辑角色提交完整 UTF-8 文本，程序只接受角色允许的路径。删除、符号链接穿越和凭据类路径被拒绝。运行目录和日志留在本地，凭据类文本做常见模式脱敏。提交前仍需检查项目文件和配置中的敏感数据。
 

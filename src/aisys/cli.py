@@ -157,6 +157,45 @@ def parser() -> argparse.ArgumentParser:
     ex_source.add_argument("--stdin", action="store_true")
     ex_submit.add_argument("--interrupt")
     ex_submit.add_argument("--human-confirmed", action="store_true")
+
+    collab = sub.add_parser(
+        "collab",
+        help="5-stage dual-model co-creation sessions (Gemini/Antigravity + Codex)",
+    )
+    co_sub = collab.add_subparsers(dest="collab_command", required=True)
+    co_create = co_sub.add_parser("create", help="create a new 5-stage dual-model session")
+    co_create.add_argument("--mode", choices=["dev", "learn"], default="dev")
+    co_create.add_argument("--task", required=True)
+    co_create.add_argument("--project", type=Path, default=None)
+    co_create.add_argument("--no-codex", action="store_true", help="do not immediately run Codex")
+    co_sub.add_parser("list", help="list co-creation sessions")
+    for name, help_text in {
+        "show": "print full session JSON",
+        "next": "print next pending Gemini/Codex/User actions as JSON",
+        "run-codex": "synchronously execute all ready Codex steps for a session",
+        "diff": "print isolated workspace diff for a session",
+    }.items():
+        co_sub.add_parser(name, help=help_text).add_argument("session_id")
+    co_submit = co_sub.add_parser("submit", help="submit a Gemini step JSON payload")
+    co_submit.add_argument("session_id")
+    co_submit.add_argument(
+        "--action",
+        choices=["propose", "critique", "merge", "execute_subtask", "review_peer"],
+        required=True,
+    )
+    co_src = co_submit.add_mutually_exclusive_group(required=True)
+    co_src.add_argument("--file", type=Path)
+    co_src.add_argument("--stdin", action="store_true")
+    co_submit.add_argument("--no-codex", action="store_true")
+    co_decide = co_sub.add_parser("decide", help="record user Stage 3 choice or fusion notes")
+    co_decide.add_argument("session_id")
+    co_decide.add_argument("--choice", choices=["gemini", "codex", "merge"], required=True)
+    co_decide.add_argument("--base", choices=["gemini", "codex"], default=None)
+    co_decide.add_argument("--notes", default="")
+    co_decide.add_argument("--no-codex", action="store_true")
+    co_guide = co_sub.add_parser("study-guide", help="output compiled Markdown study guide")
+    co_guide.add_argument("session_id")
+    co_guide.add_argument("--out", type=Path, default=None)
     return root
 
 
@@ -216,6 +255,81 @@ def invoke_exchange(args) -> int:
             print(snap.model_dump_json(indent=2))
             return int(snap.status in {"failed", "cancelled"})
     raise ValueError("unknown exchange command")
+
+
+def invoke_collab(args) -> int:
+    from .collab import CollabStore
+
+    store = CollabStore(args.data, sync_codex=True)
+    match args.collab_command:
+        case "create":
+            view = store.create_session(
+                task=args.task,
+                mode=args.mode,
+                project=str(args.project) if args.project else None,
+                auto_start_codex=not args.no_codex,
+            )
+            print(json.dumps(view, ensure_ascii=False, indent=2))
+            return 0
+        case "list":
+            print(json.dumps({"sessions": store.list_sessions()}, ensure_ascii=False, indent=2))
+            return 0
+        case "show":
+            print(json.dumps(store.get_session_view(args.session_id), ensure_ascii=False, indent=2))
+            return 0
+        case "next":
+            print(json.dumps(store.next_action(args.session_id), ensure_ascii=False, indent=2))
+            return 0
+        case "run-codex":
+            print(json.dumps(store.drive_codex(args.session_id), ensure_ascii=False, indent=2))
+            return 0
+        case "submit":
+            raw = sys.stdin.read(524_289) if args.stdin else read_input(args.file, 524_288)
+            payload = json.loads(raw)
+            auto_codex = not args.no_codex
+            match args.action:
+                case "propose":
+                    view = store.submit_gemini_proposal(args.session_id, payload, auto_codex=auto_codex)
+                case "critique":
+                    view = store.submit_gemini_critique(args.session_id, payload, auto_codex=auto_codex)
+                case "merge":
+                    view = store.submit_merged_plan(args.session_id, payload, auto_codex=auto_codex)
+                case "execute_subtask":
+                    view = store.submit_gemini_subtask(
+                        args.session_id,
+                        task_id=payload["task_id"],
+                        summary=payload.get("summary", ""),
+                        files=payload.get("files", []),
+                        auto_codex=auto_codex,
+                    )
+                case "review_peer":
+                    view = store.submit_gemini_review(args.session_id, payload, auto_codex=auto_codex)
+                case _:
+                    raise ValueError(f"unknown action: {args.action}")
+            print(json.dumps(view, ensure_ascii=False, indent=2))
+            return 0
+        case "decide":
+            view = store.decide(
+                args.session_id,
+                choice=args.choice,
+                base_model=args.base,
+                fusion_notes=args.notes,
+                auto_codex=not args.no_codex,
+            )
+            print(json.dumps(view, ensure_ascii=False, indent=2))
+            return 0
+        case "diff":
+            print(json.dumps(store.get_diff(args.session_id), ensure_ascii=False, indent=2))
+            return 0
+        case "study-guide":
+            guide = store.get_study_guide(args.session_id)
+            if args.out:
+                write_atomic(args.out, guide["markdown"].encode("utf-8"), mode=0o644)
+                print(args.out.resolve())
+            else:
+                print(guide["markdown"], end="")
+            return 0
+    raise ValueError("unknown collab command")
 
 
 def invoke(args) -> int:
@@ -288,6 +402,8 @@ def invoke(args) -> int:
             return serve_stdio(args.data)
         case "exchange":
             return invoke_exchange(args)
+        case "collab":
+            return invoke_collab(args)
         case "run":
             if not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", args.category):
                 raise ValueError("category must be a lowercase identifier")

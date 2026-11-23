@@ -164,6 +164,97 @@ TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "aisys_collab_create",
+        "description": "Create a 5-stage dual-model co-creation session (dev or learn mode).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string"},
+                "mode": {"type": "string", "enum": ["dev", "learn"], "default": "dev"},
+                "project": {"type": "string"},
+                "auto_start_codex": {"type": "boolean", "default": False},
+                "data_dir": {"type": "string"},
+            },
+            "required": ["task"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "aisys_collab_next",
+        "description": "Inspect pending Gemini/Codex/User actions for a co-creation session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "data_dir": {"type": "string"},
+            },
+            "required": ["session_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "aisys_collab_run_codex",
+        "description": "Synchronously run all ready Codex steps for a co-creation session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "data_dir": {"type": "string"},
+            },
+            "required": ["session_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "aisys_collab_submit_gemini",
+        "description": "Submit a Gemini step (propose, critique, merge, execute_subtask, or review_peer).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": ["propose", "critique", "merge", "execute_subtask", "review_peer"],
+                },
+                "payload": {"type": "object"},
+                "auto_codex": {"type": "boolean", "default": False},
+                "data_dir": {"type": "string"},
+            },
+            "required": ["session_id", "action", "payload"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "aisys_collab_decide",
+        "description": "Record the user's Stage 3 choice (gemini, codex, or merge with fusion_notes).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "choice": {"type": "string", "enum": ["gemini", "codex", "merge"]},
+                "base_model": {"type": "string", "enum": ["gemini", "codex"]},
+                "fusion_notes": {"type": "string"},
+                "auto_codex": {"type": "boolean", "default": False},
+                "data_dir": {"type": "string"},
+            },
+            "required": ["session_id", "choice"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "aisys_collab_study_guide",
+        "description": "Read the compiled structured Markdown study guide for a learn session.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "session_id": {"type": "string"},
+                "data_dir": {"type": "string"},
+            },
+            "required": ["session_id"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
@@ -271,6 +362,66 @@ class AIsysMCPServer:
 
                 run = Run.open(self._data_dir(args), args["run_id"])
                 return {"run_id": run.id, "report": redact(render_report(self._engine(run)))}
+            case "aisys_collab_create":
+                from .collab import CollabStore
+
+                store = CollabStore(self._data_dir(args), backends=self.backends, sync_codex=True)
+                return store.create_session(
+                    task=args["task"],
+                    mode=args.get("mode", "dev"),
+                    project=args.get("project"),
+                    auto_start_codex=bool(args.get("auto_start_codex", False)),
+                )
+            case "aisys_collab_next":
+                from .collab import CollabStore
+
+                store = CollabStore(self._data_dir(args), backends=self.backends, sync_codex=True)
+                return store.next_action(args["session_id"])
+            case "aisys_collab_run_codex":
+                from .collab import CollabStore
+
+                store = CollabStore(self._data_dir(args), backends=self.backends, sync_codex=True)
+                return store.drive_codex(args["session_id"])
+            case "aisys_collab_submit_gemini":
+                from .collab import CollabStore
+
+                store = CollabStore(self._data_dir(args), backends=self.backends, sync_codex=True)
+                auto_codex = bool(args.get("auto_codex", False))
+                action = args["action"]
+                payload = args["payload"]
+                if action == "propose":
+                    return store.submit_gemini_proposal(args["session_id"], payload, auto_codex=auto_codex)
+                if action == "critique":
+                    return store.submit_gemini_critique(args["session_id"], payload, auto_codex=auto_codex)
+                if action == "merge":
+                    return store.submit_merged_plan(args["session_id"], payload, auto_codex=auto_codex)
+                if action == "execute_subtask":
+                    return store.submit_gemini_subtask(
+                        args["session_id"],
+                        task_id=payload["task_id"],
+                        summary=payload.get("summary", ""),
+                        files=payload.get("files", []),
+                        auto_codex=auto_codex,
+                    )
+                if action == "review_peer":
+                    return store.submit_gemini_review(args["session_id"], payload, auto_codex=auto_codex)
+                raise ValueError(f"unknown collab action: {action}")
+            case "aisys_collab_decide":
+                from .collab import CollabStore
+
+                store = CollabStore(self._data_dir(args), backends=self.backends, sync_codex=True)
+                return store.decide(
+                    args["session_id"],
+                    choice=args["choice"],
+                    base_model=args.get("base_model"),
+                    fusion_notes=args.get("fusion_notes", ""),
+                    auto_codex=bool(args.get("auto_codex", False)),
+                )
+            case "aisys_collab_study_guide":
+                from .collab import CollabStore
+
+                store = CollabStore(self._data_dir(args), backends=self.backends, sync_codex=True)
+                return store.get_study_guide(args["session_id"])
             case _:
                 raise ValueError(f"unknown tool: {name}")
 

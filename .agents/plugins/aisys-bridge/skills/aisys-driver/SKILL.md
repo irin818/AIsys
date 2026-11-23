@@ -1,104 +1,74 @@
 ---
 name: aisys-driver
 description: >-
-  Orchestrate local AIsys YAML workflows from inside Antigravity using the
-  compliant Antigravity-master architecture and Unified Task Exchange Protocol.
-  Use when the user asks to run, review, resume, or coordinate a dual-model
-  (Antigravity/Gemini + Codex) workflow in AIsys.
+  Drive AIsys 5-Stage Dual-Model Co-Creation sessions (Gemini/Antigravity + Codex)
+  with independent proposals, cross-critique, non-overlapping task division,
+  user decision/fusion, collaborative execution, mutual cross-review, and
+  structured Markdown study guides. Use when the user asks to start or continue
+  a dual-model task or learning session in AIsys.
 ---
 
-# AIsys Dual-Model Driver Runbook
+# AIsys 5-Stage Dual-Model Driver Runbook
 
-Drive AIsys YAML workflows directly from Antigravity so Gemini (native inside
-Antigravity) and Codex (via AIsys's `CodexBackend`) collaborate over a shared,
-SQLite-persisted workflow graph with Git snapshot isolation and macOS Seatbelt
-checks.
+Coordinate **Gemini (native in Antigravity)** and **Codex (via AIsys)** cleanly
+with zero extra API cost and strict mechanical anti-overlap guarantees.
 
-## Compliance & Safety Boundaries
+## Primary Workflow: 5-Stage Co-Creation (`aisys collab`)
 
-1. **Interactive user-initiated runs only**: Never set up unattended background
-   polling loops or cron jobs to drain consumer quota.
-2. **Never bypass Google client boundaries**: Never wrap `agy -p` inside AIsys
-   or touch OAuth tokens/credentials. All Google roles execute natively inside
-   this official Antigravity session.
-3. **Never auto-approve human gates**: When a pending task has
-   `kind == "approval"`, STOP immediately, present the prompt, workspace diff,
-   and test/review context to the user, and only submit `human_confirmed: true`
-   after explicit user approval or rejection.
-4. **Never mutate AIsys workspaces out-of-band**: For `scoped_write` roles,
-   return complete UTF-8 file contents in `TaskSubmission.files` so AIsys
-   validates `write_paths`, redacts secrets, and applies edits atomically.
+Use `aisys_collab_*` MCP tools when available, or invoke `.venv/bin/aisys collab ...` directly via `run_command`:
 
-## Interface Priority
+1. **Create or Resume Session**:
+   - New session: `aisys collab create --mode dev|learn --task "<user goal>" [--project /path/to/repo] --no-codex`
+   - Resume existing web-created session: `aisys collab list` → `aisys collab next <session_id>`
+2. **Stage 1 — Independent Initial Proposals (Strict Isolation)**:
+   - Write Gemini's initial proposal BEFORE reading Codex's Stage 1 output!
+   - Submit via `aisys collab submit <id> --action propose --stdin --no-codex`
+     with JSON `{"summary", "approach", "strengths", "risks"}`.
+   - Run `aisys collab run-codex <id>` so Codex produces its independent Stage 1
+     proposal and automatically advances to Stage 2 Codex critique.
+3. **Stage 2 — Cross-Critique, Upgraded Plan & Non-Overlapping Division**:
+   - Inspect `aisys collab next <id>` to read Codex's Stage 1 proposal.
+   - Produce Gemini's `critique_of_peer`, `adopted_from_peer`, refined `summary`,
+     `approach`, and a **strictly non-overlapping** `subtasks[]` table:
+     - Each subtask has `id`, `title`, `owner` (`"gemini"` or `"codex"`),
+       `objective`, `owned_paths`, `depends_on`, `acceptance`.
+     - **Hard rule**: Different owners MUST have disjoint `owned_paths`
+       (code files in `dev` mode; `sections/01_*.md`, `sections/02_*.md`, ... in
+       `learn` mode). Dependencies must be acyclic.
+   - Submit via `aisys collab submit <id> --action critique --stdin --no-codex`
+     and ensure Codex Stage 2 is complete (`aisys collab run-codex <id>`).
+4. **Stage 3 — STOP for User Decision**:
+   - Never decide for the user! Present both upgraded plans and their verified
+     non-overlapping division tables (and note the live side-by-side Web Studio
+     at `http://127.0.0.1:8765` if running).
+   - Ask the user to choose: **Adopt Gemini**, **Adopt Codex**, or **Fuse & Tweak**
+     (with optional tweak instructions).
+   - If the user replies in chat, call `aisys collab decide <id> --choice ...`;
+     if they clicked in the Web Studio, simply inspect `aisys collab next <id>`.
+5. **Stage 4 — Non-Overlapping Collaborative Execution**:
+   - If `stage == "merging"`, produce the fused conflict-free plan incorporating
+     `decision.fusion_notes` and submit `--action merge`.
+   - Loop until `stage != "executing"`:
+     - Run `aisys collab run-codex <id>` to execute ready Codex subtasks (each
+       locked strictly to its `owned_paths`).
+     - For each `execute_subtask` in `next_action.pending_gemini`, generate
+       complete UTF-8 contents ONLY for `owned_paths` and submit via
+       `aisys collab submit <id> --action execute_subtask --stdin --no-codex`.
+6. **Stage 5 — Mutual Cross-Review & Delivery**:
+   - Codex automatically audits all Gemini-owned subtasks (`aisys collab run-codex <id>`).
+   - Gemini independently audits all Codex-owned subtasks (prefer spawning a
+     fresh read-only `research` subagent fed ONLY the `review_peer` prompt!)
+     and submits `--action review_peer` (`verdict: "pass"|"fail"`, `summary`,
+     `findings`, `fix_requests`).
+   - If either side flags defects, loop back through Stage 4 fixes for only the
+     flagged subtasks, then re-review.
+   - When `stage == "completed"`:
+     - In `learn` mode: present the compiled Markdown study guide path
+       (`data/sessions/<id>/study-guide.md`) and summary.
+     - In `dev` mode: present `aisys collab diff <id>` and isolated workspace path.
 
-- If the `aisys-bridge` MCP server tools (`aisys_start_run`,
-  `aisys_submit_task_result`, `aisys_inspect_run`, etc.) are available in your
-  tool list, prefer them.
-- Otherwise, invoke the identical CLI interface via `run_command` using
-  `.venv/bin/aisys` (or `aisys` on PATH):
-  - `aisys doctor`
-  - `aisys exchange start <preset-or-yaml> --task "..." [--project /path/to/repo] [--category ...]`
-  - `aisys exchange pending <run_id>`
-  - `aisys exchange submit <run_id> --stdin [--interrupt <id>]`
-  - `aisys exchange resume <run_id>`
-  - `aisys exchange inspect <run_id>`
-  - `aisys diff <run_id> [--space <space>]`
-  - `aisys report <run_id>`
+## Legacy YAML Workflows (`aisys exchange`)
 
-## Orchestration Loop
-
-1. **Preflight**: Run `aisys doctor` (or `aisys_doctor`) to confirm `codex: ok`.
-2. **Start**: Call `aisys exchange start <workflow> --task "..."` (with
-   `--project` if targeting a Git repository; AIsys snapshots committed `HEAD`
-   into an isolated workspace under `data/<run-id>/workspaces/`).
-3. **Inspect the returned `ExchangeSnapshot`**:
-   - If `status == "complete"`: go to Step 6.
-   - If `status == "failed"` or `status == "cancelled"`: inspect `reason`,
-     `completed_tasks`, and `events`, then report honestly to the user.
-   - If `status == "recoverable"` or `status == "paused"`: inspect `events` and
-     `aisys diff` first to verify whether an interrupted step left partial
-     state, then call `aisys exchange resume <run_id>`.
-   - If `status == "waiting"`: examine `pending_tasks`.
-4. **Process `pending_tasks`**:
-   - For any task with `kind == "approval"`: STOP and ask the user for an
-     explicit approve/reject decision. Only submit with `human_confirmed: true`
-     after the user replies.
-   - For each task with `kind == "handoff"` (Google/Gemini role):
-     - **Role isolation**: Execute strictly from the task's `objective`,
-       `context.role_instructions`, `context.node_instruction`, `context.files`,
-       `context.upstream_results`, and `permissions`. When executing distinct
-       roles in the same run (e.g., `Planner` vs `Independent Reviewer`, or
-       parallel candidates), prefer spawning a fresh `research` or `self`
-       subagent (`invoke_subagent`) carrying ONLY the `TaskEnvelope` data so
-       roles cannot leak private scratchpads.
-     - Check `permissions.mode`:
-       - `read_only`: keep `files: []`.
-       - `scoped_write`: provide complete UTF-8 contents only for paths listed
-         in `permissions.write_paths`.
-     - Check `permissions.requires_verdict`:
-       - When reviewing (`requires_verdict: true`), ALWAYS set `verdict` to
-         `"pass"` or `"fail"` and put concrete actionable findings in
-         `review_feedback`.
-     - Build a `TaskSubmission` JSON:
-       ```json
-       {
-         "protocol_version": 1,
-         "task_id": "<envelope.task_id>",
-         "interrupt_id": "<envelope.interrupt_id>",
-         "status": "completed",
-         "result": "<concise summary of plan, implementation, or review>",
-         "verdict": "pass | fail | none",
-         "files": [],
-         "review_feedback": "<specific actionable findings when reviewing>"
-       }
-       ```
-     - Submit it with `aisys exchange submit <run_id> --stdin` (or
-       `aisys_submit_task_result`). AIsys validates permissions, persists the
-       result to SQLite, and automatically advances Codex nodes, sandboxed
-       checks, conditional routes, and bounded rework loops until the next
-       pending task or completion.
-5. Repeat Steps 3–4 until the run reaches a terminal status or awaits human
-   approval.
-6. **Deliver**: Run `aisys report <run_id>` and `aisys diff <run_id>` (for each
-   modified workspace) and present the final summary, diff, and isolated
-   workspace path to the user.
+For custom YAML workflow presets (`dual_auto`, `software`, `research`, etc.),
+`aisys exchange start/pending/submit/resume/inspect` remains fully supported.
+Never auto-approve `kind == "approval"` gates without explicit user confirmation.
