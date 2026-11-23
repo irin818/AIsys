@@ -1,0 +1,85 @@
+version: 1
+name: Software development
+start: triage
+budget:
+  steps: 24
+  model_calls: 6
+agents:
+  planner:
+    role: Planner
+    backend: google
+    on_unavailable: handoff
+    instructions: Propose the smallest implementation and test plan. Identify assumptions and acceptance criteria.
+  engineer:
+    role: Executor
+    backend: codex
+    instructions: Implement the task in solution.py using the plan and any review or test feedback. Return the full file.
+    write_paths: [solution.py]
+  reviewer:
+    role: Reviewer
+    backend: google
+    on_unavailable: handoff
+    instructions: Independently review the implementation and local test outcome. Return pass or fail with concrete findings.
+nodes:
+  triage:
+    kind: route
+    next: plan
+    routes:
+      - when: {category: analysis}
+        to: analysis
+      - when: {category: high_risk}
+        to: approve_start
+  analysis:
+    kind: agent
+    agent: planner
+    instruction: Produce an analysis and recommendations without modifying code.
+    next: summary
+  approve_start:
+    kind: approval
+    instruction: Confirm the task scope before sending it to the planner.
+    next: plan
+  plan:
+    kind: agent
+    agent: planner
+    files: [solution.py]
+    next: implement
+  implement:
+    kind: agent
+    agent: engineer
+    files: [solution.py]
+    inputs: [plan, test, review]
+    max_visits: 3
+    next: test
+  test:
+    kind: check
+    max_visits: 3
+    timeout: 30
+    argv: [python, -c, "from pathlib import Path; compile(Path('solution.py').read_text(), 'solution.py', 'exec'); print('Syntax check passed')"]
+    next: review
+    routes:
+      - when: {status: failed}
+        to: approve_fix
+  review:
+    kind: agent
+    agent: reviewer
+    files: [solution.py]
+    inputs: [plan, implement, test]
+    max_visits: 3
+    next: summary
+    routes:
+      - when: {verdict: fail}
+        to: approve_fix
+      - when: {verdict: none}
+        to: require_verdict
+  require_verdict:
+    kind: approval
+    instruction: Accept only after reviewing the code and confirming that the reviewer omitted the explicit verdict.
+    next: summary
+  approve_fix:
+    kind: approval
+    max_visits: 2
+    instruction: Inspect the latest test output and review. Approve one more attempt or reject to end the run.
+    next: implement
+  summary:
+    kind: report
+    inputs: [analysis, plan, implement, test, review]

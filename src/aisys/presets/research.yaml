@@ -1,0 +1,43 @@
+version: 1
+name: Research collaboration
+start: literature
+agents:
+  researcher:
+    role: Researcher
+    backend: google
+    on_unavailable: handoff
+    instructions: Analyze the supplied sources and propose a reproducible method. Record source URLs, uncertainties, and claims that still need verification.
+  analyst:
+    role: Computational analyst
+    backend: codex
+    instructions: Implement the proposed calculation in analysis.py. Expose analyze() as the entry point and document input assumptions in the code.
+    write_paths: [analysis.py]
+  reviewer:
+    role: Methods reviewer
+    backend: google
+    on_unavailable: handoff
+    instructions: Assess study assumptions, numerical correctness, and reproducibility. Label each unverified citation or claim.
+nodes:
+  literature:
+    kind: agent
+    agent: researcher
+    next: compute
+  compute:
+    kind: agent
+    agent: analyst
+    inputs: [literature]
+    files: [analysis.py]
+    next: verify
+  verify:
+    kind: check
+    argv: [python, -c, "import runpy; assert callable(runpy.run_path('analysis.py')['analyze']); print('Analysis entry point verified')"]
+    next: review
+  review:
+    kind: agent
+    agent: reviewer
+    inputs: [literature, compute, verify]
+    files: [analysis.py]
+    next: report
+  report:
+    kind: report
+    inputs: [literature, compute, verify, review]

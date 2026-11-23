@@ -1,0 +1,61 @@
+version: 1
+name: Competitive coding example
+start: candidates
+agents:
+  implementer:
+    role: Candidate A
+    backend: codex
+    instructions: Implement solve(text) in solution.py. Return the full file. Work independently of the other candidate.
+    write_paths: [solution.py]
+  alternate:
+    role: Candidate B
+    backend: google
+    on_unavailable: handoff
+    instructions: Implement solve(text) in solution.py independently. Return JSON with summary, decision set to none, and a files array containing path and complete content.
+    write_paths: [solution.py]
+  judge:
+    role: Independent reviewer
+    backend: codex
+    instructions: Review the candidates against the task and identical deterministic tests. Only passing candidates qualify. Explain your assessment and cite the check results. Set decision pass if at least one is acceptable, fail otherwise.
+nodes:
+  candidates:
+    kind: parallel
+    branches: [candidate_a, candidate_b]
+    next: tests
+  candidate_a:
+    kind: agent
+    agent: implementer
+    space: candidate_a
+    files: [solution.py]
+  candidate_b:
+    kind: agent
+    agent: alternate
+    space: candidate_b
+    files: [solution.py]
+  tests:
+    kind: parallel
+    branches: [test_a, test_b]
+    routes:
+      - when: {result: test_a, status: ok}
+        to: judge
+      - when: {result: test_b, status: ok}
+        to: judge
+  test_a:
+    kind: check
+    space: candidate_a
+    argv: [python, -c, "from solution import solve; assert [solve(s) for s in ('', 'ab', '🙂好')] == ['', 'ba', '好🙂']; print('3 cases passed')"]
+  test_b:
+    kind: check
+    space: candidate_b
+    argv: [python, -c, "from solution import solve; assert [solve(s) for s in ('', 'ab', '🙂好')] == ['', 'ba', '好🙂']; print('3 cases passed')"]
+  judge:
+    kind: agent
+    agent: judge
+    shared_files:
+      - {space: candidate_a, path: solution.py}
+      - {space: candidate_b, path: solution.py}
+    inputs: [test_a, test_b]
+    next: report
+  report:
+    kind: report
+    inputs: [candidate_a, candidate_b, test_a, test_b, judge]
