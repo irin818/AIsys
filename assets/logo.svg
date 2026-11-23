@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <radialGradient id="gGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#08F1D4" stop-opacity="0.34"/>
+      <stop offset="62%" stop-color="#00F59B" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#030606" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="gMint" x1="20" y1="20" x2="108" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#08F1D4"/>
+      <stop offset="100%" stop-color="#10B981"/>
+    </linearGradient>
+    <linearGradient id="gEmerald" x1="108" y1="20" x2="20" y2="108" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#00F59B"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="104" height="104" rx="28" fill="#050A09" stroke="url(#gMint)" stroke-width="2.6"/>
+  <circle cx="64" cy="64" r="46" fill="url(#gGlow)"/>
+  <circle cx="49" cy="64" r="22" stroke="url(#gMint)" stroke-width="3.6"/>
+  <circle cx="79" cy="64" r="22" stroke="url(#gEmerald)" stroke-width="3.6"/>
+  <path d="M64 46C68.6 51 71.4 57.2 71.4 64C71.4 70.8 68.6 77 64 82C59.4 77 56.6 70.8 56.6 64C56.6 57.2 59.4 51 64 46Z" fill="#08F1D4" fill-opacity="0.3" stroke="#6EE7B7" stroke-width="2"/>
+  <circle cx="64" cy="64" r="5.2" fill="#08F1D4"/>
+</svg>

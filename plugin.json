@@ -1,0 +1,12 @@
+{
+  "name": "aisys-dual",
+  "displayName": "AIsys 双满血协同 (/dc)",
+  "description": "Turn OpenAI Codex CLI into a full-power parallel Sub-Agent inside Antigravity (Gemini host) with smart capability routing, Git Worktree physical isolation, mechanical anti-overlap Diff Gate, multi-turn resume, and native code review.",
+  "version": "2.0.0",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/dc ",
+    "/dc:learn ",
+    "/dc:review"
+  ]
+}

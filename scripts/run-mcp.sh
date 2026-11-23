@@ -7,13 +7,8 @@ if command -v python3 >/dev/null 2>&1; then
 else
   script_dir=$(CDPATH= cd -P -- "$(dirname -- "$script_path")" && pwd)
 fi
-repo_root=$(CDPATH= cd -P -- "$script_dir/../../../.." && pwd)
+repo_root=$(CDPATH= cd -P -- "$script_dir/.." && pwd)
 
-if [ -x "$repo_root/.venv/bin/python" ]; then
-  py="$repo_root/.venv/bin/python"
-else
-  py=$(command -v python3)
-fi
-
+py=$(command -v python3)
 export PYTHONPATH="$repo_root/src${PYTHONPATH:+:$PYTHONPATH}"
 exec "$py" -m aisys --data "$repo_root/data" mcp

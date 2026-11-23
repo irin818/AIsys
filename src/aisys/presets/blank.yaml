@@ -1,7 +1,0 @@
-version: 1
-name: Blank workflow
-start: report
-agents: {}
-nodes:
-  report:
-    kind: report

@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "orchestrator": {
+    "aisys_codex": {
       "command": "/bin/sh",
       "args": ["./scripts/run-mcp.sh"]
     }

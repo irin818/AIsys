@@ -1,40 +1,34 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "aisys"
-version = "0.1.0"
-description = "Local, configurable agent workflows with durable human handoff"
+version = "2.0.0"
+description = "Full-power Dual-Model Native Antigravity Plugin (Gemini Host + OpenAI Codex CLI Sub-Agent)"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-  "fastapi==0.165.0",
-  "langgraph==1.2.24",
-  "langgraph-checkpoint-sqlite==3.1.3",
-  "pydantic==2.14.4",
-  "PyYAML==6.0.4",
-  "textual==8.2.8",
-  "uvicorn==0.54.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=9,<10", "ruff>=0.15,<1"]
+dev = [
+  "pytest>=8.3,<10",
+  "ruff>=0.8,<1",
+]
 
 [project.scripts]
-aisys = "aisys.cli:main"
+aisys = "aisys.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-aisys = ["presets/*.yaml", "web/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.ruff]
+line-length = 120
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I", "B"]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
