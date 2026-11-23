@@ -1,4 +1,5 @@
 """Load and validate declarative workflow definitions."""
+import re
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated, Literal
@@ -6,6 +7,7 @@ from typing import Annotated, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 Id = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,47}$")]
 Status = Literal[
     "ok", "failed", "timeout", "rate_limit", "auth", "unavailable", "invalid",
@@ -169,11 +171,74 @@ def preset_names() -> list[str]:
                   if path.name.endswith(".yaml"))
 
 
-def configuration_text(reference: str) -> str:
+def custom_workflow_dir(data: Path) -> Path:
+    return data.resolve() / "config" / "workflows"
+
+
+def custom_workflow_names(data: Path | None) -> list[str]:
+    if data is None:
+        return []
+    directory = custom_workflow_dir(data)
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path.name.removesuffix(".yaml")
+        for path in directory.iterdir()
+        if path.is_file() and not path.is_symlink() and path.name.endswith(".yaml")
+        and ID_RE.fullmatch(path.name.removesuffix(".yaml"))
+    )
+
+
+def available_workflow_names(data: Path | None = None) -> list[str]:
+    return sorted(set(preset_names()) | set(custom_workflow_names(data)))
+
+
+def configuration_text(reference: str, *, data: Path | None = None) -> str:
+    if data is not None and ID_RE.fullmatch(reference):
+        custom = custom_workflow_dir(data) / f"{reference}.yaml"
+        if custom.is_file() and not custom.is_symlink():
+            with custom.open(encoding="utf-8") as stream:
+                return stream.read(262_145)
     if reference in preset_names():
         return files("aisys.presets").joinpath(f"{reference}.yaml").read_text(encoding="utf-8")
     with Path(reference).open(encoding="utf-8") as stream:
         return stream.read(262_145)
+
+
+def dump_workflow_yaml(workflow: Workflow) -> str:
+    raw = workflow.model_dump(mode="json")
+    if not raw.get("project_notes"):
+        raw.pop("project_notes", None)
+    for agent in raw.get("agents", {}).values():
+        if agent.get("model") is None:
+            agent.pop("model", None)
+        if not agent.get("write_paths"):
+            agent.pop("write_paths", None)
+        if not agent.get("reuse_session"):
+            agent.pop("reuse_session", None)
+        if agent.get("on_unavailable") == "stop":
+            agent.pop("on_unavailable", None)
+    for node in raw.get("nodes", {}).values():
+        if node.get("agent") is None:
+            node.pop("agent", None)
+        if not node.get("instruction"):
+            node.pop("instruction", None)
+        if node.get("space") == "main":
+            node.pop("space", None)
+        for key in ("files", "shared_files", "inputs", "argv", "branches", "routes"):
+            if not node.get(key):
+                node.pop(key, None)
+        if node.get("timeout") == 120:
+            node.pop("timeout", None)
+        if node.get("retries") == 0:
+            node.pop("retries", None)
+        if node.get("max_visits") == 1:
+            node.pop("max_visits", None)
+        if node.get("next") == "end":
+            node.pop("next", None)
+        for route in node.get("routes", []):
+            route["when"] = {k: v for k, v in route["when"].items() if v is not None}
+    return yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)
 
 
 def parse_config(content: str) -> Workflow:

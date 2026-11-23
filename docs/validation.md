@@ -39,8 +39,20 @@ macOS 沙箱测试核对了本地 Python 可运行，工作区外的样例文件
 
 验证过程中首次真实调用 Codex 时还暴露并修复了两个仅真机可见的问题：Antigravity shell 下 PATH 缺失 ChatGPT.app 内置 `codex` 路径，以及 Codex 在子目录向上扫描宿主 `AGENTS.md` 触发 `os error 1`（通过 `-c project_doc_max_bytes=0` 修复）。
 
+## 一键启动与统一 Web 工作台验证 · 2026-11-23
+
+在独立隔离数据目录 `data/web-e2e/` 与自动化测试夹具中完成全部 10 项 Web 与启动器验证：
+
+| 测试项 | 验证方式与真实观测证据 | 结果 |
+| --- | --- | --- |
+| Test 1 & 2：一键启动、重复启动与外来端口保护 | 真实执行 `./AIsys.command`（含空格路径 `aisys data with spaces`）：自动启动 Uvicorn 并通过 `/api/health` 校验；二次执行检测已运行实例且 PID 不变；显式端口被非 AIsys socket 占用时报错且不终止该 socket；默认端口被占用时自动切至空闲端口；`aisys stop` 优雅停止并清理 `server.json`。 | **通过** |
+| Test 3 & 4：Agent 与 Workflow 配置持久化及冲突校验 | `tests/test_web.py` 验证 Agent/Workflow CRUD、乐观锁 `expected_revision`（过期返回 HTTP 409）、非法 YAML/路径校验、跨服务实例重启后持久读取。 | **通过** |
+| Test 5 & 6：Web 提交真实 Codex 任务 + SSE 实时监控 | 通过 `./AIsys.command` 启动的真实 `http://127.0.0.1:8765` 提交 `local_coding` 任务（Run `e07226a8-a2e0-40b0-b551-dc8d44d67cce`）：真实 Codex `implement`（`01a20901-eba7-7f80-91f0-53a1da9fa8cb`, `9.19s`, `14505`/`200` tokens）生成 `answer.py` → Seatbelt 语法检查（`0.059s`）→ 真实 Codex `review`（`01a20902-0fa9-7172-9100-0a38545cf3d9`, `5.886s`, `verdict: pass`）；SSE 实时收到 `connected` / `runs_changed` / `run_update`；`/api/runs/{id}/diff` 返回含 `def is_palindrome` 的新增文件 diff。 | **通过** |
+| Test 7 & 8：审批、Google 交接返工、取消、关机确认与安全防护 | 验证缺失 `X-AIsys-Token` / 跨站 `Origin` / `Sec-Fetch-Site` / 非法 `Host` 均返回 `403`；敏感路径拒绝 `400`；未认证 Codex 显示 `installed`（非 `callable`）并拦截误启动；审批未传 `human_confirmed` 拒绝 `400`，确认后推进；活跃任务存在时关机返回 `409`，确认后安全停止。 | **通过** |
+| Test 9 & 10：兼容性回归与 Web ↔ CLI 状态一致性 | `python -m pytest -q`（34 项全过）、`ruff check src tests`、`compileall`、`pip check`、`pip wheel`、`node --check`（`app.js`/`graph.js`）与 68 个 DOM ID 静态检查全部通过；Web 修改保存的工作流与真实 Run `e07226a8` 在 `aisys validate` / `aisys show --json` 中读取状态完全一致。 | **通过** |
+
 ## 仍受限制的验证与边界
 
-- **第三方后台无交互自动调用 Google**：Google 个人订阅条款禁止由 AIsys 从外部封装 `agy -p` 或无人值守轮询；离开官方 Antigravity 会话单独在终端运行 `aisys` 时，Google 节点仍保持人工交接。
-- **新会话内实时 MCP 工具调用**：本会话启动时工作区插件尚未存在，MCP 工具调用的实时协议握手已通过 `run-mcp.sh` 真实 stdio 子进程验证，Antigravity 客户端内 MCP 工具列表注入将在新开或重载会话时生效；当前及所有会话均可通过 `aisys exchange` CLI 立即可用。
-- **自动化测试区分**：`python -m pytest -q`（含 `tests/test_exchange.py`）使用 `Stub` / `StubCodex` 验证协议状态机、护栏与 MCP 逻辑；上表 6 项 E2E 验证为真实双模型与真实 Codex CLI 执行记录。 [集成架构](antigravity-integration.md)
+- **内置浏览器截图渲染检查未完成**：尝试调用内置 `webview_browser` 对 `http://127.0.0.1:8765` 截图检查时，宿主环境返回 `ISOLATED_WORLD_UNAVAILABLE` 未能获取渲染快照；已完成 JS 语法检查、68 个 DOM ID 完整性校验及全量 HTTP/SSE/真实 Codex 端到端验证，建议你在 macOS 本地双击 `AIsys.command` 在 Safari/Chrome 中直观体验。
+- **第三方后台无交互自动调用 Google**：Google 个人订阅条款禁止由 AIsys 从外部封装 `agy -p` 或无人值守轮询；离开官方 Antigravity 会话单独在终端/Web 运行 `aisys` 时，Google 节点保持安全交接。
+- **自动化测试区分**：`python -m pytest -q`（34 项）中的模型节点使用 `Stub` / `StubCodex`，`AIsys.command` / Uvicorn / Seatbelt / Git / SIGTERM / MCP stdio 均为真机进程；上表与前节 E2E 验证均为真实 Codex CLI 与真实双模型执行记录。 [集成架构](antigravity-integration.md)

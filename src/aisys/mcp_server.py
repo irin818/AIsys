@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TextIO
 
 from .backends import Edit, default_backends
-from .config import configuration_text, parse_config, preset_names
+from .config import available_workflow_names, configuration_text, parse_config
 from .engine import Engine
 from .process import redact
 from .protocol import (
@@ -194,9 +194,9 @@ class AIsysMCPServer:
                     for health in [backend.health()]
                 }
             case "aisys_list_presets":
-                return {"presets": preset_names()}
+                return {"presets": available_workflow_names(self._data_dir(args))}
             case "aisys_validate_workflow":
-                wf = parse_config(configuration_text(args["workflow"]))
+                wf = parse_config(configuration_text(args["workflow"], data=self._data_dir(args)))
                 return {
                     "name": wf.name,
                     "start": wf.start,
@@ -207,9 +207,10 @@ class AIsysMCPServer:
                 category = args.get("category", "general")
                 if not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", category):
                     raise ValueError("category must be a lowercase identifier")
-                wf = parse_config(configuration_text(args["workflow"]))
+                data_dir = self._data_dir(args)
+                wf = parse_config(configuration_text(args["workflow"], data=data_dir))
                 project = Path(args["project"]).expanduser() if args.get("project") else None
-                run = Run.create(self._data_dir(args), wf, args["task"], category, project)
+                run = Run.create(data_dir, wf, args["task"], category, project)
                 engine = self._engine(run)
                 view = engine.drive()
                 snap = build_exchange_snapshot(engine, view)

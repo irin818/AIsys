@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="aisys-csrf" content="__AISYS_CSRF_TOKEN__" />
+  <title>AIsys · 本地双模型智能体工作台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">A</div>
+        <div>
+          <div class="brand-title">AIsys</div>
+          <div class="brand-sub">Dual-Model Workbench</div>
+        </div>
+      </div>
+
+      <div class="sse-pill" id="sse-status">
+        <span class="dot"></span>
+        <span id="sse-label">正在连接实时事件流…</span>
+      </div>
+
+      <nav class="nav-list" aria-label="主导航">
+        <button class="nav-item active" data-view="dashboard">
+          <span class="nav-icon">◈</span><span>总览 Dashboard</span>
+        </button>
+        <button class="nav-item" data-view="tasks">
+          <span class="nav-icon">▶</span><span>任务中心 Tasks</span>
+          <span class="nav-badge hidden" id="nav-active-badge">0</span>
+        </button>
+        <button class="nav-item" data-view="workflows">
+          <span class="nav-icon">⬡</span><span>工作流编辑器 Builder</span>
+        </button>
+        <button class="nav-item" data-view="agents">
+          <span class="nav-icon">◎</span><span>Agent 管理</span>
+        </button>
+        <button class="nav-item" data-view="logs">
+          <span class="nav-icon">≡</span><span>日志中心 Logs</span>
+        </button>
+        <button class="nav-item" data-view="settings">
+          <span class="nav-icon">⚙</span><span>设置与生命周期</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button class="btn btn-primary btn-full" id="btn-quick-new-task">+ 新建任务</button>
+        <div class="footer-row">
+          <button class="btn btn-ghost btn-sm" id="btn-theme-toggle" title="切换浅色/深色主题">◐ 切换主题</button>
+          <button class="btn btn-danger-ghost btn-sm" id="btn-stop-service" title="停止整个 AIsys 后台服务">⏻ 停止服务</button>
+        </div>
+        <div class="meta-footnote" id="sidebar-server-meta">127.0.0.1 · Local only</div>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <!-- DASHBOARD VIEW -->
+      <section class="view active" id="view-dashboard">
+        <header class="view-header">
+          <div>
+            <h1>总览 Dashboard</h1>
+            <p class="subtitle">实时监控本地 LangGraph 编排内核、模型后端真实状态与任务队列</p>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-secondary" id="btn-refresh-dashboard">↻ 刷新后端状态</button>
+            <button class="btn btn-primary" id="btn-dash-new-task">+ 启动新任务</button>
+          </div>
+        </header>
+
+        <div class="grid-2" id="dashboard-backends"></div>
+        <div class="stats-grid" id="dashboard-stats"></div>
+
+        <div class="grid-2 dashboard-lower">
+          <div class="card">
+            <div class="card-header">
+              <h2>活跃与待处理任务</h2>
+              <button class="btn btn-link" data-jump="tasks">查看全部 →</button>
+            </div>
+            <div id="dashboard-active-runs" class="list-stack"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2>可用工作流</h2>
+              <button class="btn btn-link" data-jump="workflows">打开编辑器 →</button>
+            </div>
+            <div id="dashboard-workflows" class="list-stack"></div>
+          </div>
+        </div>
+
+        <div class="grid-2 dashboard-lower">
+          <div class="card">
+            <div class="card-header">
+              <h2>最近完成与失败</h2>
+            </div>
+            <div id="dashboard-recent-terminal" class="list-stack"></div>
+          </div>
+          <div class="card">
+            <div class="card-header">
+              <h2>最近运行日志与提示</h2>
+              <button class="btn btn-link" data-jump="logs">日志中心 →</button>
+            </div>
+            <div id="dashboard-logs" class="log-compact-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TASKS VIEW -->
+      <section class="view" id="view-tasks">
+        <header class="view-header">
+          <div>
+            <h1>任务调度与执行中心</h1>
+            <p class="subtitle">统一由本地 LangGraph + SQLite 驱动，与 CLI / Textual 共享同一任务状态</p>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-secondary" id="btn-refresh-runs">↻ 刷新</button>
+            <button class="btn btn-primary" id="btn-tasks-new-task">+ 新建任务</button>
+          </div>
+        </header>
+
+        <div class="filter-bar" id="run-filter-tabs">
+          <button class="chip active" data-filter="all">全部</button>
+          <button class="chip" data-filter="running">正在执行</button>
+          <button class="chip" data-filter="queued">待执行队列</button>
+          <button class="chip" data-filter="waiting">待审批 / 交接</button>
+          <button class="chip" data-filter="complete">已完成</button>
+          <button class="chip" data-filter="failed">执行失败</button>
+          <button class="chip" data-filter="cancelled">已取消</button>
+        </div>
+
+        <div class="split-layout tasks-split">
+          <div class="card panel-list">
+            <div id="runs-list" class="list-stack"></div>
+          </div>
+          <div class="card panel-detail" id="run-detail-panel">
+            <div class="empty-state">选择左侧任务查看实时节点状态、输出、审批操作与代码 Diff，或点击右上角“新建任务”。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- WORKFLOWS VIEW -->
+      <section class="view" id="view-workflows">
+        <header class="view-header">
+          <div>
+            <h1>可视化工作流编辑器</h1>
+            <p class="subtitle">可视化增删节点、拖拽连线、配置路由与循环，并与统一 YAML Schema 实时同步</p>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-secondary" id="btn-wf-import">导入 YAML</button>
+            <button class="btn btn-secondary" id="btn-wf-new">+ 新建空白工作流</button>
+          </div>
+        </header>
+
+        <div class="builder-shell">
+          <div class="card builder-sidebar">
+            <div class="card-header">
+              <h2>工作流列表</h2>
+            </div>
+            <div id="wf-list" class="list-stack"></div>
+          </div>
+
+          <div class="builder-workspace">
+            <div class="card builder-toolbar">
+              <div class="toolbar-row">
+                <div class="toolbar-left">
+                  <input type="text" id="wf-name-input" class="input input-title" placeholder="工作流名称" />
+                  <span class="pill pill-muted" id="wf-source-badge">—</span>
+                  <span class="pill" id="wf-valid-badge">未校验</span>
+                </div>
+                <div class="toolbar-right">
+                  <div class="seg-control">
+                    <button class="seg-btn active" id="btn-mode-visual">可视化画布</button>
+                    <button class="seg-btn" id="btn-mode-yaml">YAML 源码</button>
+                  </div>
+                  <button class="btn btn-secondary btn-sm" id="btn-wf-validate">✓ 校验</button>
+                  <button class="btn btn-secondary btn-sm" id="btn-wf-duplicate">复制</button>
+                  <button class="btn btn-secondary btn-sm" id="btn-wf-export">导出</button>
+                  <button class="btn btn-danger-ghost btn-sm" id="btn-wf-delete">删除 / 重置</button>
+                  <button class="btn btn-primary btn-sm" id="btn-wf-save">保存配置</button>
+                  <button class="btn btn-success btn-sm" id="btn-wf-launch">▶ 启动</button>
+                </div>
+              </div>
+              <div id="wf-validation-banner" class="banner hidden"></div>
+            </div>
+
+            <div class="builder-body" id="wf-visual-pane">
+              <div class="card graph-stage-card">
+                <div class="graph-toolbar">
+                  <div class="graph-add-group">
+                    <span class="muted-label">添加节点：</span>
+                    <button class="btn btn-ghost btn-xs" data-add-node="agent">+ Agent</button>
+                    <button class="btn btn-ghost btn-xs" data-add-node="check">+ 本地测试</button>
+                    <button class="btn btn-ghost btn-xs" data-add-node="approval">+ 人工审批</button>
+                    <button class="btn btn-ghost btn-xs" data-add-node="route">+ 条件路由</button>
+                    <button class="btn btn-ghost btn-xs" data-add-node="parallel">+ 并行分支</button>
+                    <button class="btn btn-ghost btn-xs" data-add-node="report">+ 报告</button>
+                  </div>
+                  <div class="graph-view-group">
+                    <button class="btn btn-ghost btn-xs" id="btn-graph-layout">自动排版</button>
+                    <button class="btn btn-ghost btn-xs" id="btn-graph-zoom-out">−</button>
+                    <button class="btn btn-ghost btn-xs" id="btn-graph-zoom-fit">适配</button>
+                    <button class="btn btn-ghost btn-xs" id="btn-graph-zoom-in">+</button>
+                  </div>
+                </div>
+                <div class="graph-hint">拖拽节点调整位置；从节点右侧圆点拖向另一节点可快速连接 <code>next</code> 路由；点击节点在右侧配置属性。</div>
+                <div class="graph-canvas" id="wf-graph-canvas"></div>
+              </div>
+
+              <div class="card inspector-card">
+                <div class="inspector-tabs">
+                  <button class="tab-btn active" data-inspector="node">节点属性</button>
+                  <button class="tab-btn" data-inspector="agents">工作流 Agent</button>
+                  <button class="tab-btn" data-inspector="budget">预算与说明</button>
+                </div>
+                <div id="wf-inspector-content" class="inspector-body"></div>
+              </div>
+            </div>
+
+            <div class="card yaml-pane hidden" id="wf-yaml-pane">
+              <textarea id="wf-yaml-editor" class="code-editor" spellcheck="false"></textarea>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- AGENTS VIEW -->
+      <section class="view" id="view-agents">
+        <header class="view-header">
+          <div>
+            <h1>Agent 配置管理</h1>
+            <p class="subtitle">基于同一模型后端定义多个可复用逻辑角色（Coder / Debugger / Tester / Planner / Researcher / Reviewer）</p>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-primary" id="btn-new-agent">+ 创建 Agent</button>
+          </div>
+        </header>
+
+        <div class="card template-strip">
+          <div class="muted-label">从内置角色模板快速创建：</div>
+          <div id="agent-templates-row" class="chip-row"></div>
+        </div>
+
+        <div class="split-layout agents-split">
+          <div class="card panel-list">
+            <div id="agents-list" class="list-stack"></div>
+          </div>
+          <div class="card panel-detail" id="agent-editor-panel">
+            <div class="empty-state">选择左侧 Agent 编辑配置，或点击上方模板/按钮创建新角色。</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- LOGS VIEW -->
+      <section class="view" id="view-logs">
+        <header class="view-header">
+          <div>
+            <h1>统一日志中心</h1>
+            <p class="subtitle">聚合服务日志、工作流路由、Agent 真实执行记录、审批与配置审计（已自动脱敏）</p>
+          </div>
+          <div class="header-actions">
+            <button class="btn btn-secondary" id="btn-refresh-logs">↻ 刷新日志</button>
+          </div>
+        </header>
+
+        <div class="card log-filter-card">
+          <select id="log-category" class="input input-sm">
+            <option value="all">全部类别</option>
+            <option value="service">服务 (service)</option>
+            <option value="task">任务 (task)</option>
+            <option value="workflow">工作流 (workflow)</option>
+            <option value="agent">Agent 执行 (agent)</option>
+            <option value="approval">审批与交接 (approval)</option>
+            <option value="config">配置变更 (config)</option>
+            <option value="error">错误 (error)</option>
+          </select>
+          <select id="log-level" class="input input-sm">
+            <option value="all">全部级别</option>
+            <option value="info">Info</option>
+            <option value="warning">Warning</option>
+            <option value="error">Error</option>
+          </select>
+          <input type="text" id="log-run-id" class="input input-sm" placeholder="按 Run ID 筛选（可选）" />
+          <input type="text" id="log-search" class="input input-sm" placeholder="关键词搜索…" />
+          <button class="btn btn-primary btn-sm" id="btn-apply-log-filter">筛选</button>
+        </div>
+
+        <div class="card">
+          <div id="logs-table" class="log-full-list"></div>
+        </div>
+      </section>
+
+      <!-- SETTINGS VIEW -->
+      <section class="view" id="view-settings">
+        <header class="view-header">
+          <div>
+            <h1>系统设置与生命周期</h1>
+            <p class="subtitle">仅绑定本地 127.0.0.1，所有运行数据与配置保存在受控 data/ 目录</p>
+          </div>
+        </header>
+
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-header"><h2>本地服务配置</h2></div>
+            <form id="settings-form" class="form-stack">
+              <label class="field">
+                <span>监听地址（仅限本地回环）</span>
+                <input type="text" id="cfg-host" class="input" value="127.0.0.1" readonly />
+              </label>
+              <label class="field">
+                <span>默认端口（修改后下次启动生效）</span>
+                <input type="number" id="cfg-port" class="input" min="1024" max="65535" />
+              </label>
+              <label class="field">
+                <span>最大并发任务数（防止同时争抢资源）</span>
+                <input type="number" id="cfg-concurrency" class="input" min="1" max="8" />
+              </label>
+              <label class="field">
+                <span>默认项目目录（可选，需为有效 Git 仓库）</span>
+                <div class="inline-row">
+                  <input type="text" id="cfg-default-project" class="input" placeholder="/path/to/git/repo" />
+                  <button type="button" class="btn btn-secondary btn-sm" id="btn-cfg-validate-project">校验目录</button>
+                </div>
+                <small id="cfg-project-hint" class="muted-text"></small>
+              </label>
+              <div class="form-actions">
+                <button type="submit" class="btn btn-primary">保存设置</button>
+              </div>
+            </form>
+          </div>
+
+          <div class="card">
+            <div class="card-header"><h2>服务生命周期与安全边界</h2></div>
+            <div id="settings-runtime-info" class="kv-list"></div>
+            <div class="divider"></div>
+            <p class="muted-text">
+              关闭浏览器标签页不会中断后台正在执行的工作流。如需彻底关闭本地 Web 服务，请使用下方按钮（不会误杀非 AIsys 进程）。
+            </p>
+            <div class="form-actions">
+              <button class="btn btn-danger" id="btn-settings-stop-service">⏻ 停止整个 AIsys 服务</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- MODAL CONTAINER -->
+  <div class="modal-backdrop hidden" id="modal-backdrop">
+    <div class="modal-dialog" id="modal-dialog" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <h3 id="modal-title">弹窗</h3>
+        <button class="btn btn-ghost btn-xs" id="modal-close">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-footer" id="modal-footer"></div>
+    </div>
+  </div>
+
+  <!-- TOAST STACK -->
+  <div class="toast-stack" id="toast-stack"></div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

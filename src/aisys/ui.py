@@ -22,7 +22,7 @@ from textual.widgets import (
     TextArea,
 )
 
-from .config import configuration_text, parse_config, preset_names
+from .config import available_workflow_names, configuration_text, parse_config
 from .engine import Engine
 from .state import Run, list_runs
 from .workspace import artifacts
@@ -56,7 +56,7 @@ class Workbench(App):
         with TabbedContent(initial="runs" if self.run_id else "workflow"):
             with TabPane("Workflow", id="workflow"), VerticalScroll():
                 yield Label("Preset")
-                yield Select([(name, name) for name in preset_names()], value="blank",
+                yield Select([(name, name) for name in available_workflow_names(self.data)], value="blank",
                              allow_blank=False, id="presets")
                 yield Label("Custom YAML path")
                 with Horizontal(classes="row"):
@@ -64,7 +64,7 @@ class Workbench(App):
                     yield Button("Load", id="load")
                     yield Button("Save copy", id="save")
                 yield Label("YAML")
-                yield TextArea(configuration_text("blank"), id="yaml", show_line_numbers=True)
+                yield TextArea(configuration_text("blank", data=self.data), id="yaml", show_line_numbers=True)
                 yield Button("Validate & show graph", id="validate")
                 yield Static(id="topology", markup=False)
                 yield Label("Task")
@@ -141,7 +141,7 @@ class Workbench(App):
     @on(Select.Changed, "#presets")
     def choose_preset(self, message: Select.Changed) -> None:
         if isinstance(message.value, str):
-            self.query_one("#yaml", TextArea).load_text(configuration_text(message.value))
+            self.query_one("#yaml", TextArea).load_text(configuration_text(message.value, data=self.data))
             self.validate_yaml()
 
     @on(Select.Changed, "#run-select")
@@ -173,7 +173,7 @@ class Workbench(App):
                     if not filename:
                         raise ValueError("Enter a YAML file path")
                     if message.button.id == "load":
-                        content = configuration_text(filename)
+                        content = configuration_text(filename, data=self.data)
                         parse_config(content)
                         self.query_one("#yaml", TextArea).load_text(content)
                         self.validate_yaml()

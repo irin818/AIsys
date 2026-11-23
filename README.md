@@ -1,10 +1,29 @@
 # AIsys
 
-AIsys 是一套 macOS 本地智能体工作流。用 YAML 定义角色和条件路由，用 Codex CLI 调用已登录的 ChatGPT 账号，用 SQLite 保存每个运行。终端工作台支持编辑配置、启动任务和跟踪节点。
+AIsys 是一套 macOS 本地多智能体工作流平台。支持通过根目录 `AIsys.command` 一键启动本地 Web 工作台（默认 `http://127.0.0.1:8765`），也保留完整 CLI、Textual 终端工作台与 MCP 接口；全部入口共享同一个 LangGraph 编排内核、YAML 声明式配置与 SQLite 持久化状态。
 
-**接入现状** · Codex 已真实接通。Google 个人订阅禁止由第三方应用直接封装 `agy -p` 或无人值守轮询；现已通过 **Antigravity 主控 + 统一任务交换协议** 实现合规双模型协作：在官方 Antigravity 会话内由 Antigravity 原生承担 Google/Gemini 角色，通过 `aisys exchange` CLI 或仓库内置工作区插件 `.agents/plugins/aisys-bridge/`（`aisys mcp`）驱动 AIsys 与 Codex 自动接力、沙箱测试及循环审查返工。脱离 Antigravity 单独运行 CLI/工作台时，仍完整保留 Google 人工交接。 [接入调查](docs/discovery.md) · [Antigravity 集成](docs/antigravity-integration.md)
+**接入现状** · Codex 已真实接通（支持 PATH 优先及 macOS ChatGPT.app 内置 CLI 自动发现）。Google 个人订阅禁止由第三方应用直接封装 `agy -p` 或无人值守轮询；现已通过 **Antigravity 主控 + 统一任务交换协议** 实现合规双模型协作，脱离 Antigravity 单独使用 Web/CLI/工作台时，Google 节点自动暂停并支持在 Web 交接面板或 CLI 中提交核阅结果。 [接入调查](docs/discovery.md) · [Antigravity 集成](docs/antigravity-integration.md)
 
-## 安装和启动
+## 一键启动 Web 工作台（推荐）
+
+在 Finder 中直接双击项目根目录的 **`AIsys.command`**（或在终端运行 `./AIsys.command`）：
+
+1. 自动定位项目目录并检查 `.venv` 与依赖（已安装时不重复安装）。
+2. 检查本地是否已有已验证的 AIsys 实例在运行：若已运行直接打开浏览器，不重复启动；若端口被其他程序占用则**不终止该进程**并自动回退到空闲端口（或提示冲突）。
+3. 后台独立启动仅绑定 `127.0.0.1` 的 FastAPI 服务（默认 `http://127.0.0.1:8765`，可通过 `AISYS_PORT` 或 Web 设置更改），通过 `/api/health` 健康检查后自动打开浏览器。
+4. 关闭浏览器标签页或启动终端不会中断正在执行的工作流；可在 Web 左下角点击「停止服务」或运行 `aisys stop` 优雅停止。
+
+Web 工作台包含 **总览 Dashboard**（区分已安装/已认证/可调用/正在执行/受限/不可用/未验证的后端状态）、**任务中心**（SSE 实时监控、审批与 Google 交接、代码 Diff、队列与控制）、**可视化工作流编辑器**（拖拽节点与连线、条件路由与循环配置、与 YAML 双向实时同步）、**Agent 管理**（单后端多角色与模板库）、**统一日志中心** 及 **深色/浅色主题**。
+
+也可以在命令行直接管理 Web 服务：
+
+```sh
+aisys serve --open        # 启动并打开浏览器
+aisys status              # 检查本地服务是否运行
+aisys stop                # 优雅停止已验证的本地服务
+```
+
+## 安装与 CLI 启动
 
 要求 macOS、Python 3.12 或更新版本及 Git。真实模型节点另需 PATH 上的 Codex CLI 和现有 ChatGPT 登录。
 
@@ -104,10 +123,11 @@ aisys resume RUN_ID --accept --file response.txt
 
 | 职责 | 模块 |
 | --- | --- |
-| Workflow 与 Agent | `config.py` 校验配置，`presets/` 提供可复制的 YAML（含 `dual_auto`） |
+| Workflow 与 Agent | `config.py` 校验配置（支持 `presets/` 与 `data/config/workflows/` 统一解析），`services.py` 提供统一业务服务层与 Agent 库 |
+| Web 与启动器 | `web_server.py`（FastAPI 仅绑定 `127.0.0.1` + CSRF/Origin/Host 防护 + SSE）、`web/` 零构建工作台与可视化编辑器、`AIsys.command` 一键启动 |
 | Orchestrator | `engine.py` 编译 LangGraph，负责条件路由、并行汇合、预算、人工中断和恢复 |
 | Exchange & MCP | `protocol.py` 定义统一任务交换信封/提交/审计，`mcp_server.py` 提供零依赖本地 stdio MCP |
-| Model Backend | `backends.py` 管理 Codex CLI（支持 macOS ChatGPT.app 内置回退）和 Google 可用性边界 |
+| Model Backend | `backends.py` 管理 Codex CLI（支持 macOS ChatGPT.app 内置回退与 `project_doc_max_bytes=0` 隔离）和 Google 可用性边界 |
 | Tool | `workspace.py` 处理快照、上下文、受限编辑和本地检查，`process.py` 限制子进程时间及输出量 |
 | State | `state.py` 冻结配置，保存 SQLite 检查点及外部执行记录，每个运行只允许一个驱动进程 |
 

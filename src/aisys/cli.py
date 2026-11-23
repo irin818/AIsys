@@ -8,7 +8,13 @@ import sys
 from pathlib import Path
 
 from .backends import default_backends
-from .config import Workflow, configuration_text, parse_config, preset_names
+from .config import (
+    Workflow,
+    available_workflow_names,
+    configuration_text,
+    parse_config,
+    preset_names,
+)
 from .engine import Engine
 from .mcp_server import serve_stdio
 from .process import PROCESS_INTERRUPTED, redact
@@ -116,6 +122,14 @@ def parser() -> argparse.ArgumentParser:
     sub.choices["diff"].add_argument("--space", default="main")
     monitor = sub.add_parser("ui", help="open the local terminal workbench")
     monitor.add_argument("--run")
+    serve = sub.add_parser("serve", help="start the local AIsys Web Workbench server")
+    serve.add_argument("--host", default=None, help="loopback host (default: 127.0.0.1)")
+    serve.add_argument("--port", type=int, default=None, help="TCP port (default: 8765 or server.yaml)")
+    serve.add_argument("--open", action="store_true", help="open default browser once healthy")
+    serve.add_argument("--project-root", type=Path, default=None, help="project root for instance identity")
+    status_cmd = sub.add_parser("status", help="check whether the local AIsys Web server is running")
+    status_cmd.add_argument("--json", action="store_true")
+    sub.add_parser("stop", help="gracefully stop the verified local AIsys Web server")
     sub.add_parser("mcp", help="run the local stdio MCP server for Antigravity integration")
     exchange = sub.add_parser(
         "exchange",
@@ -154,7 +168,7 @@ def invoke_exchange(args) -> int:
         case "start":
             if not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", args.category):
                 raise ValueError("category must be a lowercase identifier")
-            workflow = parse_config(configuration_text(args.workflow))
+            workflow = parse_config(configuration_text(args.workflow, data=args.data))
             task = args.task if args.task is not None else read_input(args.task_file, 12_000)
             run = Run.create(args.data, workflow, task, args.category, args.project)
             engine = Engine(run)
@@ -216,13 +230,13 @@ def invoke(args) -> int:
         case "schema":
             print(json.dumps(Workflow.model_json_schema(), ensure_ascii=False, indent=2))
         case "presets":
-            print("\n".join(preset_names()))
+            print("\n".join(available_workflow_names(args.data)))
         case "init":
             with args.output.open("x", encoding="utf-8") as stream:
-                stream.write(configuration_text(args.preset))
+                stream.write(configuration_text(args.preset, data=args.data))
             print(args.output.resolve())
         case "validate":
-            workflow = parse_config(configuration_text(args.workflow))
+            workflow = parse_config(configuration_text(args.workflow, data=args.data))
             print(f"{workflow.name} · start: {workflow.start}")
             for name, node in workflow.nodes.items():
                 suffix = f" · {workflow.agents[node.agent].backend}" if node.agent else ""
@@ -239,6 +253,37 @@ def invoke(args) -> int:
             from .ui import Workbench
 
             Workbench(args.data, args.run).run()
+        case "serve":
+            from .web_server import run_server
+
+            return run_server(
+                args.data,
+                host=args.host,
+                port=args.port,
+                open_browser=args.open,
+                project_root=args.project_root,
+            )
+        case "status":
+            from .web_server import inspect_server_status
+
+            info = inspect_server_status(args.data)
+            if args.json:
+                print(json.dumps(info, ensure_ascii=False, indent=2))
+            elif info.get("running"):
+                print(f"running  {info['url']}  pid={info['pid']}  active_runs={info.get('active_runs', 0)}")
+            else:
+                print(f"stopped  ({info.get('reason', 'not running')})")
+            return 0 if info.get("running") else 1
+        case "stop":
+            from .web_server import inspect_server_status
+
+            info = inspect_server_status(args.data)
+            if not info.get("running"):
+                print(f"AIsys web server is not running ({info.get('reason', 'stopped')}).")
+                return 0
+            os.kill(int(info["pid"]), signal.SIGTERM)
+            print(f"Sent SIGTERM to AIsys web server (pid={info['pid']}, {info['url']}).")
+            return 0
         case "mcp":
             return serve_stdio(args.data)
         case "exchange":
@@ -246,7 +291,7 @@ def invoke(args) -> int:
         case "run":
             if not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", args.category):
                 raise ValueError("category must be a lowercase identifier")
-            workflow = parse_config(configuration_text(args.workflow))
+            workflow = parse_config(configuration_text(args.workflow, data=args.data))
             task = args.task if args.task is not None else read_input(args.task_file, 12_000)
             run = Run.create(args.data, workflow, task, args.category, args.project)
             print(f"Run {run.id}", flush=True)
