@@ -2,6 +2,7 @@
 import json
 import re
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Protocol
@@ -12,6 +13,8 @@ from pydantic import Field
 from .config import Agent, Model, Status, Verdict
 from .process import ProcessResult, cli_env, redact, run_process
 from .workspace import write_atomic
+
+BUNDLED_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex")
 
 REPLY_SCHEMA = {
     "type": "object",
@@ -32,8 +35,9 @@ REPLY_SCHEMA = {
     "required": ["summary", "decision", "files"],
 }
 GOOGLE_REASON = (
-    "Google personal plans do not support wrapping Antigravity CLI in this orchestrator. "
-    "Gemini CLI consumer sign-in has been retired. See docs/discovery.md."
+    "Google personal plans do not support wrapping Antigravity CLI in a third-party orchestrator, "
+    "and Gemini CLI consumer sign-in has been retired. Run Google nodes via Antigravity host "
+    "orchestration (aisys exchange) or manual handoff. See docs/discovery.md."
 )
 USAGE_FIELDS = {
     "input_tokens", "output_tokens", "cached_input_tokens",
@@ -83,12 +87,18 @@ class GoogleBackend:
         return self.health()
 
 
+def codex_executable() -> str | None:
+    return shutil.which("codex") or (
+        shutil.which(str(BUNDLED_CODEX)) if sys.platform == "darwin" else None
+    )
+
+
 class CodexBackend:
     name = "codex"
     handoff_reason = None
 
     def health(self) -> BackendResult:
-        exe = shutil.which("codex")
+        exe = codex_executable()
         if not exe:
             return BackendResult(status="unavailable", error="Codex CLI is not on PATH")
         result = run_process([exe, "login", "status"], Path.home(), cli_env(), 5)
@@ -109,7 +119,7 @@ class CodexBackend:
         remaining = timeout - (time.monotonic() - start)
         if remaining <= 0:
             return BackendResult(status="timeout", error="Codex login check used the time limit")
-        exe = shutil.which("codex")
+        exe = codex_executable()
         if not exe:
             return BackendResult(status="unavailable", error="Codex CLI is not on PATH")
         schema_path = cwd / "reply-schema.json"
@@ -127,6 +137,7 @@ class CodexBackend:
             "-c", 'mcp_servers={}',
             "-c", 'agents.enabled=false',
             "-c", 'skills.bundled.enabled=false',
+            "-c", 'project_doc_max_bytes=0',
             "-c", 'default_permissions="aisys"',
             "-c", 'permissions.aisys.filesystem={":minimal"="read"}',
             "--disable", "shell_tool", "--disable", "unified_exec",

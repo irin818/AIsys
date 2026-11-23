@@ -23,6 +23,7 @@ class Result(Model):
     status: Status
     output: str = ""
     verdict: Verdict = "none"
+    review_feedback: str = ""
     artifacts: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     duration: float = 0

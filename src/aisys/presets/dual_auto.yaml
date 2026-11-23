@@ -1,0 +1,63 @@
+version: 1
+name: Dual-model closed loop (Antigravity + Codex)
+start: plan
+budget:
+  steps: 24
+  model_calls: 8
+agents:
+  planner:
+    role: Planner
+    backend: google
+    on_unavailable: handoff
+    instructions: Produce a concise, testable implementation plan and acceptance criteria. Do not modify files.
+  engineer:
+    role: Executor
+    backend: codex
+    instructions: Implement or repair solution.py strictly following the plan, local test output, and any review feedback. Return the complete UTF-8 file.
+    write_paths: [solution.py]
+  reviewer:
+    role: Independent Reviewer
+    backend: google
+    on_unavailable: handoff
+    instructions: Independently review solution.py and the local check output against the task and plan. Set verdict to pass only if correct and complete; otherwise set verdict to fail with specific actionable review_feedback.
+nodes:
+  plan:
+    kind: agent
+    agent: planner
+    files: [solution.py]
+    next: implement
+  implement:
+    kind: agent
+    agent: engineer
+    files: [solution.py]
+    inputs: [plan, test, review]
+    max_visits: 4
+    next: test
+  test:
+    kind: check
+    max_visits: 4
+    timeout: 30
+    argv: [python, -c, "from pathlib import Path; compile(Path('solution.py').read_text(), 'solution.py', 'exec'); print('Syntax check passed')"]
+    next: review
+    routes:
+      - when: {status: failed}
+        to: implement
+  review:
+    kind: agent
+    agent: reviewer
+    files: [solution.py]
+    inputs: [plan, implement, test]
+    max_visits: 4
+    next: summary
+    routes:
+      - when: {verdict: fail}
+        to: implement
+      - when: {verdict: none}
+        to: require_verdict
+  require_verdict:
+    kind: approval
+    instruction: The reviewer omitted an explicit pass/fail verdict. Inspect solution.py before accepting delivery.
+    next: summary
+  summary:
+    kind: report
+    inputs: [plan, implement, test, review]

@@ -2,7 +2,7 @@
 
 AIsys 是一套 macOS 本地智能体工作流。用 YAML 定义角色和条件路由，用 Codex CLI 调用已登录的 ChatGPT 账号，用 SQLite 保存每个运行。终端工作台支持编辑配置、启动任务和跟踪节点。
 
-**接入现状** · Codex 已真实接通。Google AI 个人订阅的第三方自动调用受官方支持范围限制。含 Google 的预设会在交接节点暂停，由你在官方客户端生成结果、检查内容并导入。 [接入调查](docs/discovery.md)
+**接入现状** · Codex 已真实接通。Google 个人订阅禁止由第三方应用直接封装 `agy -p` 或无人值守轮询；现已通过 **Antigravity 主控 + 统一任务交换协议** 实现合规双模型协作：在官方 Antigravity 会话内由 Antigravity 原生承担 Google/Gemini 角色，通过 `aisys exchange` CLI 或仓库内置工作区插件 `.agents/plugins/aisys-bridge/`（`aisys mcp`）驱动 AIsys 与 Codex 自动接力、沙箱测试及循环审查返工。脱离 Antigravity 单独运行 CLI/工作台时，仍完整保留 Google 人工交接。 [接入调查](docs/discovery.md) · [Antigravity 集成](docs/antigravity-integration.md)
 
 ## 安装和启动
 
@@ -31,6 +31,7 @@ aisys diff RUN_ID
 
 | 预设 | 流程 |
 | --- | --- |
+| `dual_auto` | Antigravity/Google 规划 → Codex 实现 → 本地沙箱检查 → Antigravity/Google 独立审查；测试或审查失败自动路由返工（受 `max_visits` 与 `budget` 限制）。 |
 | `software` | Google 规划交接 → Codex 实现 → 本地测试 → Google 审查交接。测试或审查失败时先审批再返工。 |
 | `research` | Google 分析已有资料和研究方法 → Codex 编写验证代码 → 本地检查 → Google 审阅 → 报告。 |
 | `independent` | Codex 与 Google 分支独立分析，之后由另一逻辑角色比较。Google 分支经人工交接。 |
@@ -46,6 +47,22 @@ aisys run my-workflow.yaml --category code --project /path/to/git/repo --task-fi
 ```
 
 `--project` 取指定仓库的已提交 HEAD，按 workspace 分别构建无远程、无共享 Git 元数据的独立副本。省略时创建空白 Git 工作区。实际修改进入 `data/<run-id>/workspaces/<space>`，由用户检查并选择如何合并。原仓库的未提交改动、未跟踪文件、符号链接、子模块和匹配敏感规则的路径不会进入快照。Git 归档属性也适用。
+
+## Antigravity 主控协作（统一任务交换协议）
+
+在官方 Antigravity 客户端中打开本仓库时，Antigravity 会自动发现工作区插件 `.agents/plugins/aisys-bridge/`（包含 `aisys-driver` Skill 与本地 stdio MCP 服务 `aisys mcp`），无需修改全局配置。也可直接通过结构化 CLI 驱动任意 YAML 预设：
+
+```sh
+aisys doctor
+aisys exchange start dual_auto --project /path/to/git/repo --category code --task '实现需求...'
+aisys exchange pending RUN_ID
+aisys exchange submit RUN_ID --stdin < submission.json
+aisys exchange resume RUN_ID
+aisys exchange inspect RUN_ID
+aisys exchange schema
+```
+
+对含 `kind: approval` 的人工审批节点，`exchange submit` 默认拒绝自动放行，必须经用户明确确认并传入 `--human-confirmed`（或在 JSON 中设置 `"human_confirmed": true`）。详细架构与合规边界见 [Antigravity 集成文档](docs/antigravity-integration.md)。
 
 ## 人工交接和恢复
 
@@ -87,9 +104,10 @@ aisys resume RUN_ID --accept --file response.txt
 
 | 职责 | 模块 |
 | --- | --- |
-| Workflow 与 Agent | `config.py` 校验配置，`presets/` 提供可复制的 YAML |
+| Workflow 与 Agent | `config.py` 校验配置，`presets/` 提供可复制的 YAML（含 `dual_auto`） |
 | Orchestrator | `engine.py` 编译 LangGraph，负责条件路由、并行汇合、预算、人工中断和恢复 |
-| Model Backend | `backends.py` 管理 Codex CLI 和 Google 可用性，规范化结果、错误、退出码和用量 |
+| Exchange & MCP | `protocol.py` 定义统一任务交换信封/提交/审计，`mcp_server.py` 提供零依赖本地 stdio MCP |
+| Model Backend | `backends.py` 管理 Codex CLI（支持 macOS ChatGPT.app 内置回退）和 Google 可用性边界 |
 | Tool | `workspace.py` 处理快照、上下文、受限编辑和本地检查，`process.py` 限制子进程时间及输出量 |
 | State | `state.py` 冻结配置，保存 SQLite 检查点及外部执行记录，每个运行只允许一个驱动进程 |
 

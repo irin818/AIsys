@@ -25,6 +25,22 @@
 
 macOS 沙箱测试核对了本地 Python 可运行，工作区外的样例文件读取、工作区源码写入和本地端口绑定均受限。检查子进程只继承专门构造的环境。
 
-## 仍受限制的验证
+## Antigravity 主控真实双模型端到端验证 · 2026-11-23
 
-本机没有可供测试的 Google CLI，消费者订阅接入此编排应用也不在 Google 官方支持范围内。**Google CLI 实测与真实双模型自动协作均未验证。** 人工样例仅证明状态、审批和交接协议可用。当前两个账号配合的支持路径是 Codex 自动执行、Google 客户端中独立操作、人工导入结果。 [官方依据](discovery.md#google)
+在官方 Antigravity 会话内，以临时隔离目录 `data/e2e-validation/`（未改动任何既有项目或游戏 Mod 仓库）完成 6 项真实端到端验证，全部调用真实 ChatGPT 登录态下的 Codex CLI（`0.171.0-alpha.13`）与真实 Antigravity（含独立 Subagent 审查）：
+
+| 测试项 | Run ID / 夹具 | 真实执行链路与观测证据 | 结果 |
+| --- | --- | --- | --- |
+| 测试一～三：Antigravity → AIsys → Codex → Antigravity | `aef65477-438f-4e63-9e0f-7f00b9a4042b`（`e2e_dual_loop.yaml` + `temp-project@82a9d0c`） | Antigravity 发起并提交 `plan` → AIsys 自动触发真实 Codex (`01a208d9-a027-7fb1-8de2-cadf0ce3ee7c`, `17.058s`, exit 0, `input_tokens=44374`, `output_tokens=365`) 重写 `solution.py` → macOS Seatbelt 断言校验通过（`0.058s`, exit 0） → 独立隔离的 Antigravity `research` Subagent (`f8a8d153-50e8-4eab-bd7a-994ca10e5d72`) 仅基于 `TaskEnvelope` 审查并给出 `verdict: pass` → 运行 `complete`，源夹具仓库保持干净。 | **通过** |
+| 测试四：审查返工 | `5e5721e9-5e6b-4228-ac27-729898126a09`（`e2e_rework.yaml` + `rework-project@049890a`） | 首轮 Codex (`01a208da-ed7b-7311-9a71-64b53b0ec982`, `7.91s`, exit 0) 修复 `discount()` 算式并通过基础烟测 → Antigravity 审查检出缺失 3 项输入校验并返回 `verdict: fail` + 具体 `review_feedback` → AIsys 自动路由回 `implement` → 次轮 Codex (`01a208db-3535-7de3-9e71-bb79de4f473a`, `11.345s`, exit 0) 根据 `Review feedback:` 补齐 `bool`/负价/百分比范围校验 → 沙箱复测通过 → Antigravity 复审 `verdict: pass` → 实测全部边界异常通过。 | **通过** |
+| 测试五：状态恢复 | `20bcc4bf-72c0-463e-b354-6b4f4f8c0a38`（`e2e_recovery.yaml`） | 真实子进程执行 `guarded_step` 写入 1 行日志进入 `in_progress` 后发送 `SIGTERM`（exit `130`）→ `exchange inspect` 显示 `recoverable` → `exchange resume` 将已预留步骤标为 `interrupted` 且 **未重复执行**（日志行数严格保持为 `1`），自动路由至 `inspect_recovery` 审批节点 → 未带 `human_confirmed` 的提交被拒绝（exit `2`）→ 带 `--human-confirmed` 后正常完成。 | **通过** |
+| 测试六：配置切换（零 Python 改动） | `da4a85c2-e9b8-43ab-87ea-948dc8068db6`（`e2e_swapped_roles.yaml`） | 仅修改 YAML 互换角色与顺序：真实 Codex 先行规划 (`01a208dc-a3d8-7bd1-a6b1-c8cef57ffb4e`, `12.918s`) → Antigravity 通过 `scoped_write` 提交 `solution.py` → 沙箱测试通过 → 真实 Codex 审查 (`01a208dd-203d-76f0-8ac7-3d58a5861a6a`, `7.991s`) **真实检出 Kelvin 符号 `U+212A` 大小写边界缺陷**并返回 `verdict: fail` → AIsys 路由回 Antigravity 修复 → 沙箱复测通过 → Codex 复审 (`01a208dd-8075-7e70-94e2-0501782b42ff`, `7.973s`) 返回 `verdict: pass` 并交付。 | **通过** |
+| 工作区插件与 Stdio MCP 握手 | `.agents/plugins/aisys-bridge/` | Antigravity 语言服务 `GetAllPlugins` 确认自动发现 `aisys-bridge`（工作区级、`disabled: false`，含 `aisys-driver` Skill 与 `orchestrator` MCP 配置）；`pytest` 中真实子进程通过 `run-mcp.sh` 完成 `initialize` + `tools/call(aisys_list_presets)` 握手。 | **通过** |
+
+验证过程中首次真实调用 Codex 时还暴露并修复了两个仅真机可见的问题：Antigravity shell 下 PATH 缺失 ChatGPT.app 内置 `codex` 路径，以及 Codex 在子目录向上扫描宿主 `AGENTS.md` 触发 `os error 1`（通过 `-c project_doc_max_bytes=0` 修复）。
+
+## 仍受限制的验证与边界
+
+- **第三方后台无交互自动调用 Google**：Google 个人订阅条款禁止由 AIsys 从外部封装 `agy -p` 或无人值守轮询；离开官方 Antigravity 会话单独在终端运行 `aisys` 时，Google 节点仍保持人工交接。
+- **新会话内实时 MCP 工具调用**：本会话启动时工作区插件尚未存在，MCP 工具调用的实时协议握手已通过 `run-mcp.sh` 真实 stdio 子进程验证，Antigravity 客户端内 MCP 工具列表注入将在新开或重载会话时生效；当前及所有会话均可通过 `aisys exchange` CLI 立即可用。
+- **自动化测试区分**：`python -m pytest -q`（含 `tests/test_exchange.py`）使用 `Stub` / `StubCodex` 验证协议状态机、护栏与 MCP 逻辑；上表 6 项 E2E 验证为真实双模型与真实 Codex CLI 执行记录。 [集成架构](antigravity-integration.md)

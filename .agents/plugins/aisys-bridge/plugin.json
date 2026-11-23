@@ -1,0 +1,11 @@
+{
+  "name": "aisys-bridge",
+  "displayName": "AIsys Dual-Model Bridge",
+  "description": "Orchestrate local AIsys YAML workflows from Antigravity so Gemini and Codex collaborate via the structured Task Exchange Protocol with Git snapshot isolation and sandboxed checks.",
+  "version": "0.1.0",
+  "suggestedPrompts": [
+    "Use AIsys dual_auto workflow to plan, implement with Codex, test, and review a Python utility",
+    "Run AIsys independent workflow to compare Codex and Gemini architectural analyses",
+    "Inspect and resume my latest waiting or recoverable AIsys run"
+  ]
+}

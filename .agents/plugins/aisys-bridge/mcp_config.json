@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "orchestrator": {
+      "command": "/bin/sh",
+      "args": ["./scripts/run-mcp.sh"]
+    }
+  }
+}

@@ -74,9 +74,11 @@ def agent_prompt(run: Run, name: str, state: GraphState) -> str:
     for dependency in node.inputs:
         outcome = state.get("results", {}).get(dependency)
         if outcome:
+            feedback = outcome.get("review_feedback", "")
+            feedback_block = f"\nReview feedback:\n{feedback}" if feedback else ""
             append(f"Result {dependency}", (
                 f"{outcome['status']} · {outcome['verdict']}\n"
-                f"{outcome['output']}\n" + "\n".join(outcome["errors"])
+                f"{outcome['output']}{feedback_block}\n" + "\n".join(outcome["errors"])
             ))
     return redact(header) + "".join(pieces)
 
@@ -177,9 +179,12 @@ class Engine:
         backend = self.backends[agent.backend] if agent else None
         handoff_reason = backend.handoff_reason if backend and agent.on_unavailable == "handoff" else None
         if node.kind == "approval" or handoff_reason:
+            visit = state["visits"][record.node]
             prompt = agent_prompt(self.run, record.node, state) if handoff_reason else node.instruction
             response = interrupt({
                 "kind": "handoff" if handoff_reason else "approval", "node": record.node,
+                "space": record.space, "visit": visit,
+                "task_id": f"{record.task_id}:{record.node}:v{visit}",
                 "role": record.agent_role, "backend": record.backend, "reason": handoff_reason,
                 "prompt": redact(prompt), "write_paths": agent.write_paths if agent else [],
             })
@@ -187,24 +192,32 @@ class Engine:
                 return record.model_copy(update={"status": "cancelled"})
             if time.time() >= self.run.deadline:
                 return record.model_copy(update={"status": "budget", "errors": ["Run deadline reached"]})
+            feedback = redact(response.get("review_feedback", ""))[:MAX_OUTPUT]
             if response.get("reply"):
                 reply = Reply.model_validate(response["reply"])
-                visit = state["visits"][record.node]
                 stored = self.run.begin_effect(visit, record, model_call=False)
                 if stored is not None:
                     return stored
                 try:
-                    result = record.model_copy(update=self.apply_reply(record, agent, reply))
+                    updates = self.apply_reply(record, agent, reply)
+                    updates["review_feedback"] = feedback
+                    result = record.model_copy(update=updates)
                 except (ValueError, OSError) as error:
                     result = record.model_copy(update={
                         "status": "invalid", "errors": [redact(str(error)[:500])],
                     })
                 self.run.finish_effect(visit, result)
                 return result
+            errors = [redact(response["error"])[:500]] if response.get("error") else []
+            resolved_status = response.get("status")
+            if resolved_status not in {"ok", "rejected", "failed"}:
+                resolved_status = "ok" if response["accept"] else "rejected"
             return record.model_copy(update={
-                "status": "ok" if response["accept"] else "rejected",
+                "status": resolved_status,
                 "output": response.get("text", ""),
                 "verdict": response.get("verdict", "none"),
+                "review_feedback": feedback,
+                "errors": errors,
             })
 
         workspace = self.run.workspace(node.space)
@@ -338,7 +351,7 @@ class Engine:
         }
 
     def drive(self, *, interrupt_id=None, accept=None, response="", verdict="none",
-              reply_json=None) -> dict:
+              reply_json=None, review_feedback="", error="", status=None) -> dict:
         with self.run.exclusive(), self.graph() as graph:
             if self.run.control() == "cancel":
                 raise ValueError("run has been cancelled")
@@ -352,7 +365,10 @@ class Engine:
                 if interrupt_id not in pending:
                     raise ValueError("select a pending interrupt ID")
                 kind = pending[interrupt_id]["kind"]
-                if kind == "pause" and (accept is not None or response or verdict != "none"):
+                if kind == "pause" and (
+                    accept is not None or response or verdict != "none"
+                    or review_feedback or error or status is not None
+                ):
                     raise ValueError("resume a pause without an approval decision")
                 if accept is False and (response or verdict != "none" or reply_json is not None):
                     raise ValueError("reject an interrupt without a reply or verdict")
@@ -375,11 +391,27 @@ class Engine:
                     raise ValueError("a Google handoff requires reviewed response text")
                 if len(response) > MAX_OUTPUT:
                     raise ValueError(f"handoff must not exceed {MAX_OUTPUT} characters")
-                value = {"accept": accept, "text": redact(response), "verdict": verdict}
+                if len(review_feedback) > MAX_OUTPUT:
+                    raise ValueError(f"review_feedback must not exceed {MAX_OUTPUT} characters")
+                if len(error) > 2_000:
+                    raise ValueError("error must not exceed 2000 characters")
+                if status is not None and status not in {"ok", "rejected", "failed"}:
+                    raise ValueError("invalid interrupt resolution status")
+                value = {
+                    "accept": accept,
+                    "text": redact(response),
+                    "verdict": verdict,
+                    "review_feedback": redact(review_feedback),
+                    "error": redact(error),
+                }
+                if status is not None:
+                    value["status"] = status
                 if reply:
                     value["reply"] = reply.model_dump(mode="json")
                 start = Command(resume={interrupt_id: value})
-            elif accept is not None or interrupt_id is not None or response or verdict != "none" or reply_json is not None:
+            elif (accept is not None or interrupt_id is not None or response
+                  or verdict != "none" or reply_json is not None
+                  or review_feedback or error or status is not None):
                 raise ValueError("no approval is pending")
             elif not snapshot.values:
                 start = {"target": self.workflow.start, "status": "running", "visits": {}, "steps": 0}

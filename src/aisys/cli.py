@@ -10,7 +10,15 @@ from pathlib import Path
 from .backends import default_backends
 from .config import Workflow, configuration_text, parse_config, preset_names
 from .engine import Engine
+from .mcp_server import serve_stdio
 from .process import PROCESS_INTERRUPTED, redact
+from .protocol import (
+    TaskSubmission,
+    build_exchange_snapshot,
+    exchange_schemas,
+    record_exchange_snapshot,
+    submit_task,
+)
 from .state import Run, list_runs
 from .workspace import artifacts, git, write_atomic
 
@@ -40,8 +48,11 @@ def render_report(engine: Engine) -> str:
         lines.extend([
             f"### {name}", "",
             f"{result['agent_role']} · {result['backend']} · {result['status']} · {result['verdict']}", "",
-            result["output"], *result["errors"], "",
+            result["output"],
         ])
+        if result.get("review_feedback"):
+            lines.extend(["", "**Review feedback**", "", result["review_feedback"]])
+        lines.extend([*result["errors"], ""])
     lines.extend(["## Workspaces", ""])
     for space in sorted({node.space for node in engine.workflow.nodes.values()}):
         workspace = engine.run.workspace(space)
@@ -105,7 +116,92 @@ def parser() -> argparse.ArgumentParser:
     sub.choices["diff"].add_argument("--space", default="main")
     monitor = sub.add_parser("ui", help="open the local terminal workbench")
     monitor.add_argument("--run")
+    sub.add_parser("mcp", help="run the local stdio MCP server for Antigravity integration")
+    exchange = sub.add_parser(
+        "exchange",
+        help="structured Task Exchange Protocol interface for Antigravity host orchestration",
+    )
+    ex_sub = exchange.add_subparsers(dest="exchange_command", required=True)
+    ex_sub.add_parser("schema", help="print the Task Exchange Protocol JSON Schemas")
+    ex_start = ex_sub.add_parser("start", help="start a run and emit structured exchange JSON")
+    ex_start.add_argument("workflow")
+    ex_tasks = ex_start.add_mutually_exclusive_group(required=True)
+    ex_tasks.add_argument("--task")
+    ex_tasks.add_argument("--task-file", type=Path)
+    ex_start.add_argument("--category", default="general")
+    ex_start.add_argument("--project", type=Path)
+    for name, help_text in {
+        "pending": "inspect pending TaskEnvelope objects for a run as JSON",
+        "inspect": "inspect the full ExchangeSnapshot for a run as JSON",
+        "resume": "resume a paused or recoverable run and emit ExchangeSnapshot JSON",
+    }.items():
+        ex_sub.add_parser(name, help=help_text).add_argument("run_id")
+    ex_submit = ex_sub.add_parser("submit", help="submit a TaskSubmission JSON and advance the run")
+    ex_submit.add_argument("run_id")
+    ex_source = ex_submit.add_mutually_exclusive_group(required=True)
+    ex_source.add_argument("--file", type=Path)
+    ex_source.add_argument("--stdin", action="store_true")
+    ex_submit.add_argument("--interrupt")
+    ex_submit.add_argument("--human-confirmed", action="store_true")
     return root
+
+
+def invoke_exchange(args) -> int:
+    match args.exchange_command:
+        case "schema":
+            print(json.dumps(exchange_schemas(), ensure_ascii=False, indent=2))
+            return 0
+        case "start":
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", args.category):
+                raise ValueError("category must be a lowercase identifier")
+            workflow = parse_config(configuration_text(args.workflow))
+            task = args.task if args.task is not None else read_input(args.task_file, 12_000)
+            run = Run.create(args.data, workflow, task, args.category, args.project)
+            engine = Engine(run)
+            view = engine.drive()
+            snap = build_exchange_snapshot(engine, view)
+            record_exchange_snapshot(engine, snap, event="started")
+            print(snap.model_dump_json(indent=2))
+            return int(snap.status in {"failed", "cancelled"})
+        case "pending":
+            run = Run.open(args.data, args.run_id)
+            snap = build_exchange_snapshot(Engine(run))
+            payload = {
+                "protocol_version": snap.protocol_version,
+                "run_id": snap.run_id,
+                "task_id": snap.task_id,
+                "workflow_id": snap.workflow_id,
+                "status": snap.status,
+                "node": snap.node,
+                "pending_tasks": [task.model_dump(mode="json") for task in snap.pending_tasks],
+            }
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        case "inspect":
+            run = Run.open(args.data, args.run_id)
+            snap = build_exchange_snapshot(Engine(run))
+            print(snap.model_dump_json(indent=2))
+            return 0
+        case "resume":
+            run = Run.open(args.data, args.run_id)
+            engine = Engine(run)
+            view = engine.drive()
+            snap = build_exchange_snapshot(engine, view)
+            record_exchange_snapshot(engine, snap, event="resumed")
+            print(snap.model_dump_json(indent=2))
+            return int(snap.status in {"failed", "cancelled"})
+        case "submit":
+            run = Run.open(args.data, args.run_id)
+            raw = sys.stdin.read(262_145) if args.stdin else read_input(args.file, 262_144)
+            if len(raw) > 262_144:
+                raise ValueError("exchange submission exceeds 256 Ki characters")
+            submission = TaskSubmission.model_validate_json(raw)
+            if args.human_confirmed:
+                submission = submission.model_copy(update={"human_confirmed": True})
+            snap = submit_task(Engine(run), submission, interrupt_id=args.interrupt)
+            print(snap.model_dump_json(indent=2))
+            return int(snap.status in {"failed", "cancelled"})
+    raise ValueError("unknown exchange command")
 
 
 def invoke(args) -> int:
@@ -143,6 +239,10 @@ def invoke(args) -> int:
             from .ui import Workbench
 
             Workbench(args.data, args.run).run()
+        case "mcp":
+            return serve_stdio(args.data)
+        case "exchange":
+            return invoke_exchange(args)
         case "run":
             if not re.fullmatch(r"[a-z][a-z0-9_]{0,47}", args.category):
                 raise ValueError("category must be a lowercase identifier")

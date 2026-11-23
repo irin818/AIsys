@@ -32,6 +32,11 @@ codex exec --ignore-user-config --ignore-rules \
 - Google FAQ 明确把将 `agy` 封装进第三方 coding agents 或应用排除在个人订阅的支持范围之外。本项目属于第三方 Python 编排应用。官方 SDK 的程序化认证列出 Gemini API key、Google Cloud/Vertex AI 和离线本地模型，未列出用个人订阅认证 SDK 的方法。ACP 是针对官方文档列出的编辑器集成路线，未确认可用于此编排器。当前未找到同时满足个人订阅、自动调用和官方支持的 Google 云模型接入。 [Google FAQ](https://antigravity.google/docs/faq/#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) · [SDK 认证](https://antigravity.google/docs/install/#programmatic-authentication)
 - 采用 Google 后端可用性占位和显式人工交接。可在受支持的 Google 客户端独立生成结果，检查后将结果导入运行。无需购买 API 即可结合 Codex 自动执行与 Google 人工交接。全自动订阅双模型仍受 Google 接入方式限制。未来如出现明确授权的接入，沿统一接口实现。
 
+## Antigravity 主控反向协作补充 · 2026-11-23
+
+- **Codex CLI 路径与隔离修正**：在 Antigravity 终端环境中，ChatGPT.app 内置的 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`（`0.171.0-alpha.13`，`Logged in using ChatGPT`）默认不在 shell PATH 中；`CodexBackend` 现按 PATH 优先并在 macOS 上回退发现该官方内置路径。同时补充 `-c project_doc_max_bytes=0`，避免 Codex 在 `data/<run-id>/provider/<node>` 中向上读取宿主仓库 `AGENTS.md` 触发 macOS `Operation not permitted` 错误并防止宿主规则泄漏到隔离任务。
+- **合规反向协作架构（方案 A）**：复核 Google Antigravity Additional Terms of Service、FAQ、Headless CLI、ACP 与 Python SDK 文档，确认第三方应用以个人订阅封装 `agy -p` / ACP 或运行无人值守后台轮询均不符合条款，且官方 Python SDK 程序化认证需单独的 `GEMINI_API_KEY` / `VERTEX_API_KEY` / GCP ADC（与个人订阅额度不互通）。与之相对，在**官方 Antigravity 客户端的用户主动会话中**将 AIsys 作为本地工具调用（通过 `aisys exchange` CLI 或工作区级插件 `.agents/plugins/aisys-bridge/` 提供的本地 stdio MCP 服务 `aisys mcp`），由 Antigravity 原生执行所有 Google/Gemini 角色（并可通过独立 Subagent 隔离角色上下文）、AIsys 负责 LangGraph 状态机、SQLite 持久化、Seatbelt 沙箱校验和 Codex CLI 自动执行，不接触 Google OAuth 状态且零额外 API 费用。详细对比与协议规范见 [Antigravity 集成设计](antigravity-integration.md)。
+
 ## 编排与实施选择
 
 PyPI 发布的稳定版为 LangGraph 1.2.24、SQLite checkpointer 3.1.3。已在 Python 3.14.6 的开发环境和 Python 3.12.13 的独立安装环境验证运行。LangGraph 的 SQLite 快照存储图状态，外部 CLI 和文件写入另用执行记录去重，人工交接使用 checkpoint interrupt。阶段一完成后，按 Codex 实跑、人工节点与恢复、并行候选与确定性验证、本地终端界面的顺序推进。 [LangGraph 发布](https://pypi.org/project/langgraph/) · [SQLite 发布](https://pypi.org/project/langgraph-checkpoint-sqlite/) · [持久化](https://docs.langchain.com/oss/python/langgraph/persistence) · [中断](https://docs.langchain.com/oss/python/langgraph/interrupts)
