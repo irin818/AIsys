@@ -27,7 +27,7 @@ aisys stop                # 优雅停止本地服务
 aisys collab list         # 查看全部 5 步协作会话
 ```
 
-在 Antigravity 中打开本仓库后，工作区插件 `.agents/plugins/aisys-bridge/` 会自动提供 `aisys-driver` Skill 与 `aisys_collab_*` MCP 工具，直接说一句「使用 `aisys-driver` 开启双模型学习/开发：……」即可自动跑通全部 Gemini 与 Codex 接力步骤。
+在 Antigravity 中（全局已通过 `~/.gemini/config/plugins/aisys-bridge` 注册，任意工作区均生效），只需发送极简指令 **`/aisys`**（或 `/aisys 帮我彻底学懂……`），Antigravity 会自动检测并拉起本地 Web 界面（`http://127.0.0.1:8765`），调用 `aisys_collab_*` MCP 工具与本地 Codex 连续跑通全部就绪阶段。Web 端采用黑绿极光极简美学，内置 **Live Execution Topology** 实时后台拓扑图与底部可展开的 **Kernel Trace 遥测舱**，可实时透视 Codex 真实子进程 PID、`thread_id`、Token 计数、状态机跃迁与防重叠写锁 `ALLOW/DENY` 审计日志。
 
 ## 安装与 CLI 启动
 

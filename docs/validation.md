@@ -60,10 +60,11 @@ macOS 沙箱测试核对了本地 Python 可运行，工作区外的样例文件
 | 真实 5 步双模型学习闭环（含融合微调与互审返工） | Session `5a8f4636-41e4-4f20-a149-76e564e8d48e`（主题：Python 装饰器与 `functools.wraps`，`learn` 模式）：① Gemini 与真实 Codex (`input_tokens=14567`, `output_tokens=1623`) 各自独立提案 → ② 双方交叉互审并给出无重叠分工表（`division_check.valid=True`）→ ③ 融合微调锁定 2 个互斥章节（`T1`: Gemini `sections/01_mental_model.md`，`T2`: Codex `sections/02_examples_pitfalls.md`）→ ④ 各自在硬锁定路径内完成交付（真实 Codex 生成 4,669 字符带 `assert` 的示例与踩坑题）→ ⑤ 真实 Codex 在第 1 轮互审中真实检出 `T1` 遗漏闭包与近似展开 3 项细节并打回 → 系统聚合全部 3 条反馈仅令 `T1` 返工（保留 `T2` 已完成）→ 第 2 轮复审收口并自动生成 7,979 字符的结构化 `study-guide.md`（含完整两轮勘误记录）。 | **通过（真机）** |
 | 机械防重叠校验与写路径硬锁 | `tests/test_web.py` 验证跨模型共享路径（`跨模型所有权冲突`）、同模型并行写同一路径、循环依赖均在拍板/融合前硬拦截；执行期 Gemini 试图写入 Codex 的 `owned_paths` 返回 HTTP `400`。 | **通过** |
 | 一键启动、重复启动与外来端口保护 | 真实执行 `./AIsys.command`（含空格路径 `aisys studio spaces`）：健康检查通过、二次执行复用同一 PID、显式外来占用端口报错且不杀外来进程、默认端口占用自动回退空闲端口、`aisys stop` 优雅停止。 | **通过（真机）** |
-| 安全防护、兼容性回归与打包 | `pytest -q`（31 项全过）、`ruff check src tests`、`compileall`、`pip check`、`pip wheel`（验证仅打包极简 `index.html`/`styles.css`/`app.js`，无残留 `graph.js`）、`node --check`、30 个 DOM ID 完整性校验与 CSRF/Origin/Host 拦截全部通过。 | **通过** |
+| 安全防护、兼容性回归与打包 | `pytest -q`（32 项全过）、`ruff check src tests`、`compileall`、`pip check`、`pip wheel`（验证仅打包极简 `index.html`/`styles.css`/`app.js`，无残留 `graph.js`/`services.py`）、`node --check`、51 个 DOM ID 完整性校验与 CSRF/Origin/Host 拦截全部通过。 | **通过** |
+| 真实后台流式遥测与全局 Antigravity 一键配置 | 隔离目录 `data/telemetry-smoke/` 实测真实 Codex CLI（Session `c63ca7ee`，PID `23958`，thread `01a20947`，`11.16s`，`14551`/`302` tokens）：逐行流式捕获 `process.spawned` → `codex.thread.started` → `codex.item.completed` → `codex.turn.completed` 并持久化至 `events.jsonl` 与 SSE；`GetAllPlugins` 确认 `~/.gemini/config/plugins/aisys-bridge` 在全局（无工作区）与 AIsys 工作区均正常加载且无冲突，`run-mcp.sh` 经全局软链在 `/tmp` 启动并暴露全部 16 个 MCP 工具（含 6 个 `aisys_collab_*`）。 | **通过（真机）** |
 
 ## 仍受限制的验证与边界
 
-- **内置浏览器截图渲染检查未完成**：尝试调用内置 `webview_browser` 对 `http://127.0.0.1:8765` 截图检查时，宿主环境返回 `ISOLATED_WORLD_UNAVAILABLE` 未能获取渲染快照；已完成 JS 语法检查、68 个 DOM ID 完整性校验及全量 HTTP/SSE/真实 Codex 端到端验证，建议你在 macOS 本地双击 `AIsys.command` 在 Safari/Chrome 中直观体验。
-- **第三方后台无交互自动调用 Google**：Google 个人订阅条款禁止由 AIsys 从外部封装 `agy -p` 或无人值守轮询；离开官方 Antigravity 会话单独在终端/Web 运行 `aisys` 时，Google 节点保持安全交接。
-- **自动化测试区分**：`python -m pytest -q`（34 项）中的模型节点使用 `Stub` / `StubCodex`，`AIsys.command` / Uvicorn / Seatbelt / Git / SIGTERM / MCP stdio 均为真机进程；上表与前节 E2E 验证均为真实 Codex CLI 与真实双模型执行记录。 [集成架构](antigravity-integration.md)
+- **内置浏览器截图渲染检查未完成**：尝试调用内置 `webview_browser` 对 `http://127.0.0.1:8765` 截图检查时，宿主环境返回 `ISOLATED_WORLD_UNAVAILABLE` 未能获取渲染快照；已完成 JS 语法检查、51 个 DOM ID 完整性校验及全量 HTTP/SSE/真实 Codex 流式端到端验证，建议你在 macOS 本地双击 `AIsys.command` 在 Safari/Chrome 中直观体验黑绿极光美学与实时遥测舱。
+- **第三方后台无交互自动调用 Google**：Google 个人订阅条款禁止由 AIsys 从外部封装 `agy -p` 或无人值守轮询；已通过全局 Antigravity 插件预配置将触发成本降至极简 `/aisys` 一键联动。
+- **自动化测试区分**：`python -m pytest -q`（32 项）中的模型节点使用 `Stub` / `StubCodex`，`AIsys.command` / Uvicorn / Seatbelt / Git / SIGTERM / MCP stdio / `run_process` 实时流式子进程均为真机进程；上表与前节 E2E 验证均为真实 Codex CLI 与真实双模型执行记录。 [集成架构](antigravity-integration.md)

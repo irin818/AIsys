@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 from pathlib import Path
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 from aisys.backends import BackendResult, Edit, GoogleBackend, Reply
 from aisys.cli import invoke, parser
 from aisys.collab import CollabStore, ServerConfig, SubTask, validate_division
+from aisys.process import cli_env, run_process
 from aisys.web_server import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -405,6 +407,62 @@ def test_full_five_stage_learn_flow_with_fusion_write_lock_mutual_review_and_stu
     assert cli_view["stage"] == "completed"
     assert cli_view["study_guide_path"] == done["study_guide_path"]
 
+    # Real kernel telemetry stream persisted and exposed cleanly via API
+    ev_resp = client.get(f"/api/sessions/{sid}/events")
+    assert ev_resp.status_code == 200
+    events = ev_resp.json()["events"]
+    ev_types = {e["event_type"] for e in events}
+    assert {
+        "session.created",
+        "gemini.submitted",
+        "codex.step.started",
+        "codex.step.completed",
+        "division.validated",
+        "user.decided",
+        "stage.transition",
+        "writelock.audit",
+        "study_guide.compiled",
+    }.issubset(ev_types)
+    lock_decisions = {
+        e["detail"].get("decision")
+        for e in events
+        if e["event_type"] == "writelock.audit"
+    }
+    assert lock_decisions == {"ALLOW", "DENY"}
+    assert done["metrics"]["lock_allows"] >= 2
+    assert done["metrics"]["lock_denies"] >= 1
+    assert done["metrics"]["event_count"] == len(events)
+
+    # Antigravity focus endpoint enforces CSRF and stays side-effect-free in test mode
+    assert client.post("/api/focus-antigravity").status_code == 403
+    focus = client.post("/api/focus-antigravity", headers=headers)
+    assert focus.status_code == 200
+    assert focus.json()["reason"] == "test_mode"
+
+
+def test_run_process_streams_stdout_lines_and_pid_live(tmp_path):
+    pids: list[int] = []
+    lines: list[str] = []
+    script = (
+        "import sys, time\n"
+        "print('{\"type\":\"thread.started\",\"thread_id\":\"abc\"}', flush=True)\n"
+        "time.sleep(0.08)\n"
+        "print('{\"type\":\"turn.completed\"}', flush=True)\n"
+    )
+    res = run_process(
+        [sys.executable, "-c", script],
+        tmp_path,
+        cli_env(),
+        5.0,
+        on_start=pids.append,
+        on_stdout_line=lines.append,
+    )
+    assert res.code == 0
+    assert len(pids) == 1 and pids[0] > 0
+    assert len(lines) == 2
+    assert '"thread.started"' in lines[0]
+    assert '"turn.completed"' in lines[1]
+
 
 def test_launcher_one_click_duplicate_and_foreign_port_protection(tmp_path):
     data_dir = tmp_path / "aisys studio spaces"
@@ -426,7 +484,9 @@ def test_launcher_one_click_duplicate_and_foreign_port_protection(tmp_path):
         first_pid = health["pid"]
 
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as resp:
-            assert "AIsys 双模型协作室" in resp.read().decode("utf-8")
+            body = resp.read().decode("utf-8")
+            assert "AIsys · 双模型共创工作室" in body
+            assert "kernel-dock" in body
 
         second = subprocess.run([str(LAUNCHER)], env=env, capture_output=True, text=True, timeout=15)
         assert second.returncode == 0, second.stdout + second.stderr

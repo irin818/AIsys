@@ -11,6 +11,7 @@ Workflow:
 """
 import asyncio
 import fcntl
+import inspect
 import json
 import os
 import re
@@ -582,6 +583,7 @@ class CollabStore:
 
         self._lock = threading.Lock()
         self._active_codex_sessions: set[str] = set()
+        self._active_processes: dict[str, dict] = {}
         self._subscribers: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
         self._sub_lock = threading.Lock()
         self._stop_watcher = threading.Event()
@@ -593,6 +595,289 @@ class CollabStore:
         if self.backends is not None:
             return self.backends["codex"]
         return CodexBackend()
+
+    # ---------- Real Kernel Telemetry (events.jsonl + SSE) ----------
+    def _events_file(self, session_id: str) -> Path:
+        return self._session_dir(session_id) / "events.jsonl"
+
+    def record_event(
+        self,
+        session_id: str,
+        *,
+        category: Literal["engine", "codex", "gemini", "lock", "workspace"],
+        event_type: str,
+        actor: Literal["aisys", "codex", "gemini", "user"],
+        stage: str,
+        summary: str,
+        detail: dict | None = None,
+    ) -> dict:
+        ev = {
+            "id": uuid4().hex[:12],
+            "ts": round(time.time(), 3),
+            "category": category,
+            "event_type": event_type,
+            "actor": actor,
+            "stage": stage,
+            "summary": redact(summary)[:400],
+            "detail": detail or {},
+        }
+        try:
+            ev_path = self.sessions_dir / session_id / "events.jsonl"
+            if ev_path.parent.is_dir():
+                line = json.dumps(ev, ensure_ascii=False) + "\n"
+                with ev_path.open("a", encoding="utf-8") as fh:
+                    fcntl.flock(fh, fcntl.LOCK_EX)
+                    try:
+                        fh.write(line)
+                        fh.flush()
+                    finally:
+                        fcntl.flock(fh, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        self.publish("trace_event", {"session_id": session_id, "event": ev})
+        return ev
+
+    def list_events(self, session_id: str, *, limit: int = 120) -> list[dict]:
+        ev_path = self._events_file(session_id)
+        if not ev_path.is_file():
+            return []
+        try:
+            lines = ev_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        parsed: list[dict] = []
+        for raw in lines[-max(1, min(limit, 500)):]:
+            try:
+                item = json.loads(raw)
+                if isinstance(item, dict):
+                    parsed.append(item)
+            except ValueError:
+                continue
+        return parsed
+
+    def get_active_process(self, session_id: str) -> dict | None:
+        with self._lock:
+            proc = self._active_processes.get(session_id)
+            if not proc:
+                return None
+            snap = dict(proc)
+        snap["elapsed_s"] = round(max(0.0, time.time() - snap["started_at"]), 1)
+        return snap
+
+    def _set_active_process(self, session_id: str, info: dict | None) -> None:
+        with self._lock:
+            if info is None:
+                self._active_processes.pop(session_id, None)
+            else:
+                self._active_processes[session_id] = dict(info)
+
+    def _update_active_process(self, session_id: str, **updates) -> None:
+        with self._lock:
+            proc = self._active_processes.get(session_id)
+            if proc is not None:
+                proc.update(updates)
+
+    def _session_metrics(self, s: CollabSession, events: list[dict]) -> dict:
+        in_tok = 0
+        cached_tok = 0
+        out_tok = 0
+        codex_dur = 0.0
+
+        def _add(usage: dict | None, dur: float = 0.0) -> None:
+            nonlocal in_tok, cached_tok, out_tok, codex_dur
+            if isinstance(usage, dict):
+                in_tok += int(usage.get("input_tokens", 0) or 0)
+                cached_tok += int(usage.get("cached_input_tokens", 0) or 0)
+                out_tok += int(usage.get("output_tokens", 0) or 0)
+            codex_dur += float(dur or 0.0)
+
+        for prop in s.proposals.values():
+            _add(prop.usage, prop.duration)
+        for ref in s.refined.values():
+            _add(ref.usage, ref.duration)
+        for ex in s.executions.values():
+            _add(ex.usage, ex.duration)
+        for rev in s.review_history:
+            _add(rev.usage, rev.duration)
+
+        lock_allows = 0
+        lock_denies = 0
+        for ev in events:
+            if ev.get("event_type") == "writelock.audit":
+                decision = (ev.get("detail") or {}).get("decision")
+                if decision == "ALLOW":
+                    lock_allows += 1
+                elif decision == "DENY":
+                    lock_denies += 1
+        return {
+            "input_tokens": in_tok,
+            "cached_input_tokens": cached_tok,
+            "output_tokens": out_tok,
+            "total_tokens": in_tok + out_tok,
+            "codex_duration_s": round(codex_dur, 2),
+            "lock_allows": lock_allows,
+            "lock_denies": lock_denies,
+            "event_count": len(events),
+        }
+
+    def _apply_edits_audited(
+        self,
+        session_id: str,
+        *,
+        owner: Owner,
+        task_id: str,
+        stage: str,
+        ws: Path,
+        edits: list[Edit],
+        allowed: list[str],
+    ) -> list[str]:
+        allowed_set = set(allowed)
+        for ed in edits:
+            if ed.path not in allowed_set:
+                self.record_event(
+                    session_id,
+                    category="lock",
+                    event_type="writelock.audit",
+                    actor=owner,
+                    stage=stage,
+                    summary=f"写锁拦截越界写入：{owner.upper()} ({task_id}) → {ed.path}",
+                    detail={
+                        "decision": "DENY",
+                        "task_id": task_id,
+                        "owner": owner,
+                        "path": ed.path,
+                        "allowed_paths": list(allowed),
+                    },
+                )
+        try:
+            written = apply_edits(ws, edits, allowed)
+        except ValueError as err:
+            if not any(ed.path not in allowed_set for ed in edits):
+                self.record_event(
+                    session_id,
+                    category="lock",
+                    event_type="writelock.audit",
+                    actor=owner,
+                    stage=stage,
+                    summary=f"写锁校验失败：{owner.upper()} ({task_id}) · {err}",
+                    detail={
+                        "decision": "DENY",
+                        "task_id": task_id,
+                        "owner": owner,
+                        "allowed_paths": list(allowed),
+                        "error": redact(str(err))[:300],
+                    },
+                )
+            raise
+        size_by_path = {ed.path: len(ed.content.encode("utf-8")) for ed in edits}
+        for path in written:
+            self.record_event(
+                session_id,
+                category="lock",
+                event_type="writelock.audit",
+                actor=owner,
+                stage=stage,
+                summary=f"写锁放行：{owner.upper()} ({task_id}) → {path} ({size_by_path.get(path, 0)} B)",
+                detail={
+                    "decision": "ALLOW",
+                    "task_id": task_id,
+                    "owner": owner,
+                    "path": path,
+                    "bytes": size_by_path.get(path, 0),
+                    "allowed_paths": list(allowed),
+                },
+            )
+        return written
+
+    def _make_codex_stream_handler(self, session_id: str, *, stage: str, step_label: str):
+        def _handle(ev: dict) -> None:
+            etype = str(ev.get("type") or "codex.event")
+            if etype == "process.spawned":
+                pid = ev.get("pid")
+                self._update_active_process(
+                    session_id,
+                    pid=pid,
+                    sandbox=ev.get("sandbox", "read-only"),
+                    latest_event=f"子进程已拉起 (PID {pid})",
+                )
+                self.record_event(
+                    session_id,
+                    category="codex",
+                    event_type="process.spawned",
+                    actor="codex",
+                    stage=stage,
+                    summary=f"拉起 Codex 沙箱进程 ({step_label}) · PID {pid} · {ev.get('sandbox', 'read-only')}",
+                    detail=ev,
+                )
+            elif etype == "codex.thread.started":
+                tid = str(ev.get("thread_id") or "")
+                self._update_active_process(
+                    session_id,
+                    thread_id=tid,
+                    latest_event=f"Codex 线程建立 {tid[:8]}",
+                )
+                self.record_event(
+                    session_id,
+                    category="codex",
+                    event_type="codex.thread.started",
+                    actor="codex",
+                    stage=stage,
+                    summary=f"Codex 会话线程建立 · thread={tid[:8]}",
+                    detail=ev,
+                )
+            elif etype in {"codex.item.started", "codex.item.completed"}:
+                itype = str(ev.get("item_type") or "item")
+                chars = ev.get("chars", 0)
+                verb = "开始" if etype.endswith("started") else "产出"
+                label = f"Codex {verb} {itype}" + (f" ({chars} chars)" if chars else "")
+                self._update_active_process(session_id, latest_event=label)
+                self.record_event(
+                    session_id,
+                    category="codex",
+                    event_type=etype,
+                    actor="codex",
+                    stage=stage,
+                    summary=label,
+                    detail=ev,
+                )
+            elif etype == "codex.turn.completed":
+                usage = ev.get("usage") or {}
+                in_t = usage.get("input_tokens", 0)
+                out_t = usage.get("output_tokens", 0)
+                el = ev.get("elapsed_s", 0)
+                label = f"Codex 回合完成 · {el}s · in={in_t} / out={out_t} tok"
+                self._update_active_process(session_id, latest_event=label)
+                self.record_event(
+                    session_id,
+                    category="codex",
+                    event_type="codex.turn.completed",
+                    actor="codex",
+                    stage=stage,
+                    summary=label,
+                    detail=ev,
+                )
+            elif etype == "codex.error":
+                self._update_active_process(session_id, latest_event="Codex 返回错误事件")
+                self.record_event(
+                    session_id,
+                    category="codex",
+                    event_type="codex.error",
+                    actor="codex",
+                    stage=stage,
+                    summary="Codex 进程上报异常事件",
+                    detail=ev,
+                )
+        return _handle
+
+    @staticmethod
+    def _supports_kwarg(fn, name: str) -> bool:
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        if name in sig.parameters:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
     # ---------- Server config & lifecycle ----------
     def server_file(self) -> Path:
@@ -698,7 +983,9 @@ class CollabStore:
             try:
                 changed = []
                 for item in self.list_sessions()[:25]:
-                    fp = f"{item['stage']}:{item['updated_at']}:{item['codex_busy']}"
+                    ev_path = self.sessions_dir / item["id"] / "events.jsonl"
+                    ev_size = ev_path.stat().st_size if ev_path.is_file() else 0
+                    fp = f"{item['stage']}:{item['updated_at']}:{item['codex_busy']}:{ev_size}"
                     if self._fingerprints.get(item["id"]) != fp:
                         self._fingerprints[item["id"]] = fp
                         changed.append(item["id"])
@@ -786,6 +1073,21 @@ class CollabStore:
             stage="proposing",
         )
         self._save(session)
+        self.record_event(
+            sid,
+            category="engine",
+            event_type="session.created",
+            actor="user",
+            stage="proposing",
+            summary=f"初始化 {mode.upper()} 协作会话与隔离工作区（HEAD={commit[:8] if commit else 'empty'}）",
+            detail={
+                "mode": mode,
+                "task_chars": len(cleaned),
+                "has_project": bool(project_path),
+                "source_commit": commit,
+                "auto_start_codex": auto_start_codex,
+            },
+        )
         self.publish("sessions_changed", {"ids": [sid]})
         if auto_start_codex:
             self.trigger_codex_async(sid)
@@ -818,8 +1120,12 @@ class CollabStore:
     def get_session_view(self, session_id: str) -> dict:
         s = self._load(session_id)
         ws = self._workspace(session_id)
+        events = self.list_events(session_id, limit=120)
         data = s.model_dump(mode="json")
         data["codex_busy"] = self.is_codex_busy(session_id)
+        data["active_process"] = self.get_active_process(session_id)
+        data["metrics"] = self._session_metrics(s, events)
+        data["events"] = events[-80:]
         data["workspace"] = str(ws)
         data["artifacts"] = artifacts(ws)
         data["next_action"] = self.next_action(session_id)
@@ -1025,9 +1331,29 @@ class CollabStore:
                 risks=[redact(str(x)) for x in payload.get("risks", [])[:12]],
             )
             s.proposals["gemini"] = prop
+            prev_stage = s.stage
             if "codex" in s.proposals:
                 s.stage = "critiquing"
             self._save(s)
+        self.record_event(
+            session_id,
+            category="gemini",
+            event_type="gemini.submitted",
+            actor="gemini",
+            stage=prev_stage,
+            summary=f"Gemini 提交阶段 1 独立提案（{len(prop.approach)} 字符，{len(prop.strengths)} 项亮点）",
+            detail={"action": "propose", "summary": prop.summary[:220], "chars": len(prop.approach)},
+        )
+        if s.stage != prev_stage:
+            self.record_event(
+                session_id,
+                category="engine",
+                event_type="stage.transition",
+                actor="aisys",
+                stage=s.stage,
+                summary=f"状态机跃迁：{prev_stage} → {s.stage}（双方首轮预案已齐备）",
+                detail={"from": prev_stage, "to": s.stage},
+            )
         self.publish("sessions_changed", {"ids": [session_id]})
         if auto_codex:
             self.trigger_codex_async(session_id)
@@ -1050,9 +1376,48 @@ class CollabStore:
                 division_check=div,
             )
             s.refined["gemini"] = ref
+            prev_stage = s.stage
             if "codex" in s.refined:
                 s.stage = "deciding"
             self._save(s)
+        self.record_event(
+            session_id,
+            category="lock",
+            event_type="division.validated",
+            actor="aisys",
+            stage=prev_stage,
+            summary=(
+                f"防重叠算法校验 Gemini 分工表：{'通过' if div.valid else '发现冲突'}"
+                f"（{len(subtasks)} 任务，{len(div.waves)} 波次）"
+            ),
+            detail={
+                "model": "gemini",
+                "valid": div.valid,
+                "task_count": len(subtasks),
+                "waves": div.waves,
+                "conflicts": div.conflicts,
+                "warnings": div.warnings,
+            },
+        )
+        self.record_event(
+            session_id,
+            category="gemini",
+            event_type="gemini.submitted",
+            actor="gemini",
+            stage=prev_stage,
+            summary=f"Gemini 完成交叉互审并提出 {len(subtasks)} 项互斥分工",
+            detail={"action": "critique", "summary": ref.summary[:220], "division_valid": div.valid},
+        )
+        if s.stage != prev_stage:
+            self.record_event(
+                session_id,
+                category="engine",
+                event_type="stage.transition",
+                actor="aisys",
+                stage=s.stage,
+                summary=f"状态机跃迁：{prev_stage} → {s.stage}（等待你拍板或融合微调）",
+                detail={"from": prev_stage, "to": s.stage},
+            )
         self.publish("sessions_changed", {"ids": [session_id]})
         if auto_codex and s.stage == "critiquing":
             self.trigger_codex_async(session_id)
@@ -1117,6 +1482,24 @@ class CollabStore:
                 # Fusion tweak requested -> enter merging stage so Gemini/Antigravity produces fused conflict-free plan
                 s.stage = "merging"
             self._save(s)
+        self.record_event(
+            session_id,
+            category="engine",
+            event_type="user.decided",
+            actor="user",
+            stage=s.stage,
+            summary=(
+                f"用户拍板：{choice}"
+                + (f"（含融合微调意见）→ {s.stage}" if notes else f" → {s.stage}")
+            ),
+            detail={
+                "choice": choice,
+                "base_model": resolved_base,
+                "has_fusion_notes": bool(notes),
+                "next_stage": s.stage,
+                "locked_waves": s.locked_plan.division_check.waves if s.locked_plan else [],
+            },
+        )
         self.publish("sessions_changed", {"ids": [session_id]})
         if auto_codex and s.stage == "executing":
             self.trigger_codex_async(session_id)
@@ -1130,6 +1513,15 @@ class CollabStore:
             subtasks = [SubTask.model_validate(item) for item in payload.get("subtasks", [])]
             div = validate_division(subtasks)
             if not div.valid:
+                self.record_event(
+                    session_id,
+                    category="lock",
+                    event_type="division.validated",
+                    actor="aisys",
+                    stage="merging",
+                    summary="防重叠算法拒绝融合分工表：" + "；".join(div.conflicts),
+                    detail={"valid": False, "conflicts": div.conflicts},
+                )
                 raise ValueError("融合后的分工表仍存在重叠或依赖冲突：" + "；".join(div.conflicts))
             self._lock_plan(
                 s,
@@ -1143,6 +1535,24 @@ class CollabStore:
                 ),
             )
             self._save(s)
+        self.record_event(
+            session_id,
+            category="lock",
+            event_type="division.validated",
+            actor="aisys",
+            stage="executing",
+            summary=f"融合分工锁已生效（{len(subtasks)} 任务，{len(div.waves)} 波次，0 路径冲突）",
+            detail={"valid": True, "waves": div.waves, "task_count": len(subtasks)},
+        )
+        self.record_event(
+            session_id,
+            category="gemini",
+            event_type="gemini.submitted",
+            actor="gemini",
+            stage="executing",
+            summary="Gemini 提交融合锁定方案，进入阶段 4 互斥协同执行",
+            detail={"action": "merge", "task_count": len(subtasks)},
+        )
         self.publish("sessions_changed", {"ids": [session_id]})
         if auto_codex:
             self.trigger_codex_async(session_id)
@@ -1190,12 +1600,30 @@ class CollabStore:
             edits = [Edit.model_validate(item) for item in files]
             ws = self._workspace(session_id)
             # Mechanical hard write lock: strictly restricted to st.owned_paths!
-            written = apply_edits(ws, edits, st.owned_paths)
+            written = self._apply_edits_audited(
+                session_id,
+                owner="gemini",
+                task_id=task_id,
+                stage="executing",
+                ws=ws,
+                edits=edits,
+                allowed=st.owned_paths,
+            )
             check_out = ""
             if st.check_argv:
                 chk = run_check(st.check_argv, ws, 30)
                 check_out = redact((chk.stdout + "\n" + chk.stderr).strip())[:4000]
-                if chk.issue or chk.code != 0:
+                passed = not chk.issue and chk.code == 0
+                self.record_event(
+                    session_id,
+                    category="workspace",
+                    event_type="sandbox.check",
+                    actor="aisys",
+                    stage="executing",
+                    summary=f"沙箱验收 {task_id}：{'通过' if passed else '未通过'} (exit={chk.code})",
+                    detail={"task_id": task_id, "exit_code": chk.code, "issue": chk.issue, "output": check_out[:300]},
+                )
+                if not passed:
                     raise ValueError(f"子任务 {task_id} 沙箱校验未通过：{check_out}")
 
             ex.status = "completed"
@@ -1207,6 +1635,15 @@ class CollabStore:
             ex.updated_at = time.time()
             self._maybe_advance_after_execution(s, ws)
             self._save(s)
+        self.record_event(
+            session_id,
+            category="gemini",
+            event_type="gemini.submitted",
+            actor="gemini",
+            stage=s.stage,
+            summary=f"Gemini 完成子任务 {task_id}（写入 {len(written)} 个独占文件）",
+            detail={"action": "execute_subtask", "task_id": task_id, "files": written},
+        )
         self.publish("sessions_changed", {"ids": [session_id]})
         if auto_codex and s.stage in {"executing", "reviewing"}:
             self.trigger_codex_async(session_id)
@@ -1233,6 +1670,21 @@ class CollabStore:
             )
             s.reviews["gemini"] = review
             s.review_history.append(review)
+            self.record_event(
+                session_id,
+                category="gemini",
+                event_type="gemini.submitted",
+                actor="gemini",
+                stage="reviewing",
+                summary=f"Gemini 完成第 {review.round} 轮交叉审查（审查 Codex → {review.verdict.upper()}）",
+                detail={
+                    "action": "review_peer",
+                    "round": review.round,
+                    "verdict": review.verdict,
+                    "fix_count": len(fix_reqs),
+                    "summary": review.summary[:220],
+                },
+            )
             ws = self._workspace(session_id)
             self._maybe_finalize_review_round(s, ws)
             self._save(s)
@@ -1246,9 +1698,19 @@ class CollabStore:
             s = self._load(session_id)
             if s.stage in {"completed", "failed", "cancelled"}:
                 return self.get_session_view(session_id)
+            prev_stage = s.stage
             s.stage = "cancelled"
             s.error = "已由用户取消"
             self._save(s)
+        self.record_event(
+            session_id,
+            category="engine",
+            event_type="session.cancelled",
+            actor="user",
+            stage="cancelled",
+            summary=f"会话已在 {prev_stage} 阶段取消",
+            detail={"from": prev_stage},
+        )
         self.publish("sessions_changed", {"ids": [session_id]})
         return self.get_session_view(session_id)
 
@@ -1258,6 +1720,15 @@ class CollabStore:
         if all(ex.status == "completed" for ex in s.executions.values()):
             s.stage = "reviewing"
             s.reviews = {}
+            self.record_event(
+                s.id,
+                category="engine",
+                event_type="stage.transition",
+                actor="aisys",
+                stage="reviewing",
+                summary=f"状态机跃迁：executing → reviewing（全部 {len(s.executions)} 项子任务完成，启动第 {s.review_round} 轮交叉审查）",
+                detail={"from": "executing", "to": "reviewing", "round": s.review_round},
+            )
             # Auto-pass side if a model had 0 assigned subtasks to be audited
             if not any(st.owner == "codex" for st in s.locked_plan.subtasks):
                 s.reviews["gemini"] = MutualReview(
@@ -1301,6 +1772,15 @@ class CollabStore:
             s.review_round += 1
             s.reviews = {}
             s.stage = "executing"
+            self.record_event(
+                s.id,
+                category="engine",
+                event_type="stage.transition",
+                actor="aisys",
+                stage="executing",
+                summary=f"交叉审查触发定向返工：{', '.join(grouped.keys())}（保留其他已完成成果）",
+                detail={"from": "reviewing", "to": "executing", "rework_tasks": list(grouped.keys()), "next_round": s.review_round},
+            )
             return
 
         # Complete session & compile Structured Markdown Study Guide if learn mode!
@@ -1310,11 +1790,29 @@ class CollabStore:
             write_atomic(guide_out, guide.encode("utf-8"), mode=0o600)
             write_atomic(ws / "STUDY_GUIDE.md", guide.encode("utf-8"), mode=0o644)
             s.study_guide_path = str(guide_out)
+            self.record_event(
+                s.id,
+                category="workspace",
+                event_type="study_guide.compiled",
+                actor="aisys",
+                stage="completed",
+                summary=f"已自动编译结构化 Markdown 学习文档（{len(guide)} 字符，含 {len(s.review_history)} 条互审记录）",
+                detail={"chars": len(guide), "reviews": len(s.review_history)},
+            )
         s.final_summary = (
             f"双模型协同与交叉审查已完成（共 {s.review_round} 轮审查，"
             f"Gemini 审查：{g_rev.verdict}，Codex 审查：{c_rev.verdict}）。"
         )
         s.stage = "completed"
+        self.record_event(
+            s.id,
+            category="engine",
+            event_type="stage.transition",
+            actor="aisys",
+            stage="completed",
+            summary=f"状态机跃迁：reviewing → completed（{s.final_summary}）",
+            detail={"from": "reviewing", "to": "completed", "rounds": s.review_round},
+        )
 
     # ---------- Automated Codex Driver ----------
     def trigger_codex_async(self, session_id: str) -> None:
@@ -1363,10 +1861,42 @@ class CollabStore:
         broker.mkdir(mode=0o700, exist_ok=True)
         codex = self._codex()
 
+        def _call_run_json(*, prompt: str, schema: dict, timeout: float, stage: str, step_label: str):
+            self._set_active_process(session_id, {
+                "actor": "codex",
+                "stage": stage,
+                "step": step_label,
+                "started_at": time.time(),
+                "pid": None,
+                "thread_id": None,
+                "latest_event": f"正在准备 {step_label}…",
+            })
+            self.record_event(
+                session_id,
+                category="codex",
+                event_type="codex.step.started",
+                actor="codex",
+                stage=stage,
+                summary=f"调度 Codex 执行：{step_label}（prompt={len(prompt)} 字符，timeout={int(timeout)}s）",
+                detail={"step": step_label, "prompt_chars": len(prompt), "timeout_s": timeout},
+            )
+            self.publish("sessions_changed", {"ids": [session_id]})
+            handler = self._make_codex_stream_handler(session_id, stage=stage, step_label=step_label)
+            try:
+                kwargs = {"prompt": prompt, "schema": schema, "cwd": broker, "timeout": timeout}
+                if self._supports_kwarg(codex.run_json, "on_event"):
+                    kwargs["on_event"] = handler
+                return codex.run_json(**kwargs)
+            finally:
+                self._set_active_process(session_id, None)
+
         # Stage 1: Codex independent proposal
         if s.stage == "proposing" and "codex" not in s.proposals:
             prompt = self._proposal_prompt(s, ws, "codex")
-            res, data = codex.run_json(prompt=prompt, schema=PROPOSAL_SCHEMA, cwd=broker, timeout=180)
+            res, data = _call_run_json(
+                prompt=prompt, schema=PROPOSAL_SCHEMA, timeout=180,
+                stage="proposing", step_label="阶段 1 独立初案",
+            )
             with self._exclusive(session_id):
                 s = self._load(session_id)
                 if s.stage != "proposing":
@@ -1374,6 +1904,12 @@ class CollabStore:
                 if res.status != "ok" or not data:
                     s.error = redact(res.error or f"Codex Stage 1 failed ({res.status})")
                     self._save(s)
+                    self.record_event(
+                        session_id, category="codex", event_type="codex.step.failed",
+                        actor="codex", stage="proposing",
+                        summary=f"Codex 阶段 1 失败：{s.error}",
+                        detail={"status": res.status, "duration": res.duration},
+                    )
                     return False
                 s.error = ""
                 s.proposals["codex"] = Proposal(
@@ -1385,15 +1921,32 @@ class CollabStore:
                     duration=res.duration,
                     usage=res.usage,
                 )
+                prev_stage = s.stage
                 if "gemini" in s.proposals:
                     s.stage = "critiquing"
                 self._save(s)
+            self.record_event(
+                session_id, category="codex", event_type="codex.step.completed",
+                actor="codex", stage=prev_stage,
+                summary=f"Codex 完成阶段 1 独立初案（{res.duration}s）",
+                detail={"duration": res.duration, "usage": res.usage, "summary": data["summary"][:200]},
+            )
+            if s.stage != prev_stage:
+                self.record_event(
+                    session_id, category="engine", event_type="stage.transition",
+                    actor="aisys", stage=s.stage,
+                    summary=f"状态机跃迁：{prev_stage} → {s.stage}（双方首轮预案已齐备）",
+                    detail={"from": prev_stage, "to": s.stage},
+                )
             return True
 
         # Stage 2: Codex cross-critique + upgraded plan + division
         if s.stage == "critiquing" and "codex" not in s.refined and "gemini" in s.proposals and "codex" in s.proposals:
             prompt = self._critique_prompt(s, ws, "codex", s.proposals["codex"], s.proposals["gemini"])
-            res, data = codex.run_json(prompt=prompt, schema=REFINED_SCHEMA, cwd=broker, timeout=240)
+            res, data = _call_run_json(
+                prompt=prompt, schema=REFINED_SCHEMA, timeout=240,
+                stage="critiquing", step_label="阶段 2 交叉互审与分工",
+            )
             with self._exclusive(session_id):
                 s = self._load(session_id)
                 if s.stage != "critiquing":
@@ -1401,6 +1954,12 @@ class CollabStore:
                 if res.status != "ok" or not data:
                     s.error = redact(res.error or f"Codex Stage 2 failed ({res.status})")
                     self._save(s)
+                    self.record_event(
+                        session_id, category="codex", event_type="codex.step.failed",
+                        actor="codex", stage="critiquing",
+                        summary=f"Codex 阶段 2 失败：{s.error}",
+                        detail={"status": res.status, "duration": res.duration},
+                    )
                     return False
                 subtasks = []
                 parse_err = []
@@ -1424,9 +1983,32 @@ class CollabStore:
                     duration=res.duration,
                     usage=res.usage,
                 )
+                prev_stage = s.stage
                 if "gemini" in s.refined:
                     s.stage = "deciding"
                 self._save(s)
+            self.record_event(
+                session_id, category="lock", event_type="division.validated",
+                actor="aisys", stage=prev_stage,
+                summary=(
+                    f"防重叠算法校验 Codex 分工表：{'通过' if div.valid else '发现冲突'}"
+                    f"（{len(subtasks)} 任务，{len(div.waves)} 波次）"
+                ),
+                detail={"model": "codex", "valid": div.valid, "waves": div.waves, "conflicts": div.conflicts},
+            )
+            self.record_event(
+                session_id, category="codex", event_type="codex.step.completed",
+                actor="codex", stage=prev_stage,
+                summary=f"Codex 完成阶段 2 交叉互审与分工（{res.duration}s）",
+                detail={"duration": res.duration, "usage": res.usage, "division_valid": div.valid},
+            )
+            if s.stage != prev_stage:
+                self.record_event(
+                    session_id, category="engine", event_type="stage.transition",
+                    actor="aisys", stage=s.stage,
+                    summary=f"状态机跃迁：{prev_stage} → {s.stage}（等待你拍板或融合微调）",
+                    detail={"from": prev_stage, "to": s.stage},
+                )
             return True
 
         # Stage 4: Execute next ready Codex subtask with hard owned_paths lock
@@ -1448,6 +2030,23 @@ class CollabStore:
                 ex.status = "running"
                 ex.updated_at = time.time()
                 self._save(s)
+            step_label = f"阶段 4 子任务 {ready_task.id} · {ready_task.title}"
+            self._set_active_process(session_id, {
+                "actor": "codex",
+                "stage": "executing",
+                "step": step_label,
+                "task_id": ready_task.id,
+                "started_at": time.time(),
+                "pid": None,
+                "thread_id": None,
+                "latest_event": f"正在执行 {ready_task.id}…",
+            })
+            self.record_event(
+                session_id, category="codex", event_type="codex.step.started",
+                actor="codex", stage="executing",
+                summary=f"调度 Codex 执行子任务 {ready_task.id}（写锁白名单：{', '.join(ready_task.owned_paths)}）",
+                detail={"task_id": ready_task.id, "owned_paths": list(ready_task.owned_paths)},
+            )
             self.publish("sessions_changed", {"ids": [session_id]})
 
             prompt = self._subtask_prompt(s, ws, ready_task, s.executions[ready_task.id].review_feedback)
@@ -1457,7 +2056,14 @@ class CollabStore:
                 instructions=ready_task.objective,
                 write_paths=list(ready_task.owned_paths),
             )
-            res = codex.run(prompt=prompt, agent=agent, cwd=broker, timeout=240)
+            handler = self._make_codex_stream_handler(session_id, stage="executing", step_label=step_label)
+            try:
+                run_kwargs = {"prompt": prompt, "agent": agent, "cwd": broker, "timeout": 240}
+                if self._supports_kwarg(codex.run, "on_event"):
+                    run_kwargs["on_event"] = handler
+                res = codex.run(**run_kwargs)
+            finally:
+                self._set_active_process(session_id, None)
             with self._exclusive(session_id):
                 s = self._load(session_id)
                 ex = s.executions[ready_task.id]
@@ -1470,14 +2076,35 @@ class CollabStore:
                     ex.error = redact(res.error or f"Codex failed ({res.status})")
                     s.error = ex.error
                     self._save(s)
+                    self.record_event(
+                        session_id, category="codex", event_type="codex.step.failed",
+                        actor="codex", stage="executing",
+                        summary=f"Codex 子任务 {ready_task.id} 失败：{ex.error}",
+                        detail={"task_id": ready_task.id, "status": res.status},
+                    )
                     return False
                 try:
-                    written = apply_edits(ws, res.reply.files, ready_task.owned_paths)
+                    written = self._apply_edits_audited(
+                        session_id,
+                        owner="codex",
+                        task_id=ready_task.id,
+                        stage="executing",
+                        ws=ws,
+                        edits=res.reply.files,
+                        allowed=ready_task.owned_paths,
+                    )
                     check_out = ""
                     if ready_task.check_argv:
                         chk = run_check(ready_task.check_argv, ws, 30)
                         check_out = redact((chk.stdout + "\n" + chk.stderr).strip())[:4000]
-                        if chk.issue or chk.code != 0:
+                        passed = not chk.issue and chk.code == 0
+                        self.record_event(
+                            session_id, category="workspace", event_type="sandbox.check",
+                            actor="aisys", stage="executing",
+                            summary=f"沙箱验收 {ready_task.id}：{'通过' if passed else '未通过'} (exit={chk.code})",
+                            detail={"task_id": ready_task.id, "exit_code": chk.code, "issue": chk.issue},
+                        )
+                        if not passed:
                             raise ValueError(f"沙箱检查失败：{check_out}")
                     ex.status = "completed"
                     ex.summary = redact(res.reply.summary)[:8000]
@@ -1485,11 +2112,23 @@ class CollabStore:
                     ex.check_output = check_out
                     ex.error = ""
                     s.error = ""
+                    self.record_event(
+                        session_id, category="codex", event_type="codex.step.completed",
+                        actor="codex", stage="executing",
+                        summary=f"Codex 完成子任务 {ready_task.id}（{res.duration}s，写入 {len(written)} 文件）",
+                        detail={"task_id": ready_task.id, "files": written, "duration": res.duration, "usage": res.usage},
+                    )
                     self._maybe_advance_after_execution(s, ws)
                 except (OSError, ValueError) as err:
                     ex.status = "failed"
                     ex.error = redact(str(err))[:500]
                     s.error = ex.error
+                    self.record_event(
+                        session_id, category="codex", event_type="codex.step.failed",
+                        actor="codex", stage="executing",
+                        summary=f"Codex 子任务 {ready_task.id} 落盘被阻断：{ex.error}",
+                        detail={"task_id": ready_task.id, "error": ex.error},
+                    )
                 self._save(s)
             return True
 
@@ -1499,7 +2138,10 @@ class CollabStore:
             if not gemini_tasks:
                 return False
             prompt = self._mutual_review_prompt(s, ws, "codex", gemini_tasks)
-            res, data = codex.run_json(prompt=prompt, schema=MUTUAL_REVIEW_SCHEMA, cwd=broker, timeout=180)
+            res, data = _call_run_json(
+                prompt=prompt, schema=MUTUAL_REVIEW_SCHEMA, timeout=180,
+                stage="reviewing", step_label=f"阶段 5 第 {s.review_round} 轮交叉审查 Gemini",
+            )
             with self._exclusive(session_id):
                 s = self._load(session_id)
                 if s.stage != "reviewing" or "codex" in s.reviews:
@@ -1507,6 +2149,12 @@ class CollabStore:
                 if res.status != "ok" or not data:
                     s.error = redact(res.error or f"Codex mutual review failed ({res.status})")
                     self._save(s)
+                    self.record_event(
+                        session_id, category="codex", event_type="codex.step.failed",
+                        actor="codex", stage="reviewing",
+                        summary=f"Codex 交叉审查失败：{s.error}",
+                        detail={"status": res.status, "duration": res.duration},
+                    )
                     return False
                 gemini_ids = {st.id for st in gemini_tasks}
                 fixes = [
@@ -1528,6 +2176,12 @@ class CollabStore:
                 s.reviews["codex"] = review
                 s.review_history.append(review)
                 s.error = ""
+                self.record_event(
+                    session_id, category="codex", event_type="codex.step.completed",
+                    actor="codex", stage="reviewing",
+                    summary=f"Codex 完成第 {review.round} 轮交叉审查（审查 Gemini → {review.verdict.upper()}，{len(fixes)} 条修复要求）",
+                    detail={"round": review.round, "verdict": review.verdict, "fix_count": len(fixes), "usage": res.usage},
+                )
                 self._maybe_finalize_review_round(s, ws)
                 self._save(s)
             return True

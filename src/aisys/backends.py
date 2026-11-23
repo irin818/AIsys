@@ -4,6 +4,7 @@ import re
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 from uuid import UUID
@@ -120,6 +121,7 @@ class CodexBackend:
         model: str | None = None,
         reuse_session: bool = False,
         session_id: str | None = None,
+        on_event: Callable[[dict], None] | None = None,
     ) -> ProcessResult | BackendResult:
         start = time.monotonic()
         ready = self.health()
@@ -160,21 +162,121 @@ class CodexBackend:
             cmd.append("--ephemeral")
         if session_id:
             cmd.append(str(UUID(session_id)))
-        return run_process([*cmd, "-"], cwd, cli_env(), remaining, prompt)
 
-    def run(self, *, prompt: str, agent: Agent, cwd: Path, timeout: float,
-            session_id: str | None = None) -> BackendResult:
+        def _emit(payload: dict) -> None:
+            if on_event is not None:
+                try:
+                    on_event(payload)
+                except Exception:
+                    pass
+
+        def _on_start(pid: int) -> None:
+            _emit({
+                "type": "process.spawned",
+                "pid": pid,
+                "executable": Path(exe).name,
+                "model": model or "default",
+                "sandbox": "read-only (isolated)",
+                "timeout_s": round(remaining, 1),
+                "prompt_chars": len(prompt),
+                "schema_keys": sorted((schema.get("properties") or {}).keys()),
+                "cwd_name": cwd.name,
+            })
+
+        def _on_stdout_line(line: str) -> None:
+            raw_line = line.strip()
+            if not raw_line:
+                return
+            try:
+                ev = json.loads(raw_line)
+            except ValueError:
+                return
+            if not isinstance(ev, dict):
+                return
+            ev_type = ev.get("type")
+            if ev_type == "thread.started":
+                _emit({
+                    "type": "codex.thread.started",
+                    "thread_id": str(ev.get("thread_id") or ""),
+                })
+            elif ev_type in {"item.started", "item.completed"}:
+                item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
+                item_type = str(item.get("type") or "unknown")
+                text = item.get("text") if isinstance(item.get("text"), str) else ""
+                preview = redact(text).strip()
+                if len(preview) > 220:
+                    preview = preview[:220] + "…"
+                _emit({
+                    "type": f"codex.{ev_type}",
+                    "item_id": str(item.get("id") or ""),
+                    "item_type": item_type,
+                    "chars": len(text),
+                    "preview": preview,
+                })
+            elif ev_type == "turn.completed":
+                counters = ev.get("usage") if isinstance(ev.get("usage"), dict) else {}
+                usage = {
+                    k: v for k, v in counters.items()
+                    if k in USAGE_FIELDS and type(v) is int and v >= 0
+                }
+                _emit({
+                    "type": "codex.turn.completed",
+                    "usage": usage,
+                    "elapsed_s": round(time.monotonic() - start, 2),
+                })
+            elif ev_type in {"error", "turn.failed"}:
+                _emit({
+                    "type": "codex.error",
+                    "detail": redact(json.dumps(ev, ensure_ascii=False))[:300],
+                })
+
+        return run_process(
+            [*cmd, "-"],
+            cwd,
+            cli_env(),
+            remaining,
+            prompt,
+            on_start=_on_start if on_event is not None else None,
+            on_stdout_line=_on_stdout_line if on_event is not None else None,
+        )
+
+    def run(
+        self,
+        *,
+        prompt: str,
+        agent: Agent,
+        cwd: Path,
+        timeout: float,
+        session_id: str | None = None,
+        on_event: Callable[[dict], None] | None = None,
+    ) -> BackendResult:
         raw = self._invoke(
             prompt=prompt, schema=REPLY_SCHEMA, cwd=cwd, timeout=timeout,
             model=agent.model, reuse_session=agent.reuse_session, session_id=session_id,
+            on_event=on_event,
         )
         if isinstance(raw, BackendResult):
             return raw
         return parse_events(raw)
 
-    def run_json(self, *, prompt: str, schema: dict, cwd: Path, timeout: float,
-                 model: str | None = None) -> tuple[BackendResult, dict | None]:
-        raw = self._invoke(prompt=prompt, schema=schema, cwd=cwd, timeout=timeout, model=model)
+    def run_json(
+        self,
+        *,
+        prompt: str,
+        schema: dict,
+        cwd: Path,
+        timeout: float,
+        model: str | None = None,
+        on_event: Callable[[dict], None] | None = None,
+    ) -> tuple[BackendResult, dict | None]:
+        raw = self._invoke(
+            prompt=prompt,
+            schema=schema,
+            cwd=cwd,
+            timeout=timeout,
+            model=model,
+            on_event=on_event,
+        )
         if isinstance(raw, BackendResult):
             return raw, None
         return parse_json_events(raw)

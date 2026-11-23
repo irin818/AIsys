@@ -3,6 +3,8 @@ import asyncio
 import json
 import os
 import secrets
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -252,6 +254,14 @@ def create_app(
     async def cancel_session(session_id: str):
         return store.cancel_session(session_id)
 
+    @app.get("/api/sessions/{session_id}/events")
+    async def session_events(session_id: str, limit: int = Query(default=150, ge=1, le=500)):
+        return {
+            "session_id": session_id,
+            "events": store.list_events(session_id, limit=limit),
+            "active_process": store.get_active_process(session_id),
+        }
+
     @app.get("/api/sessions/{session_id}/diff")
     async def session_diff(session_id: str):
         return store.get_diff(session_id)
@@ -266,6 +276,27 @@ def create_app(
                 headers={"Content-Disposition": f'attachment; filename="aisys-study-{session_id[:8]}.md"'},
             )
         return guide
+
+    @app.post("/api/focus-antigravity")
+    async def focus_antigravity():
+        candidates = [
+            Path("/Applications/Antigravity.app"),
+            Path("/Applications/Gemini.app"),
+        ]
+        found = next((p for p in candidates if p.exists()), None)
+        if allow_testserver:
+            return {"focused": False, "app": found.stem if found else None, "reason": "test_mode"}
+        if sys.platform != "darwin" or not found:
+            return {"focused": False, "app": None, "reason": "not_installed"}
+        try:
+            subprocess.Popen(
+                ["open", "-a", str(found)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return {"focused": True, "app": found.stem}
+        except OSError:
+            return {"focused": False, "app": found.stem, "reason": "launch_error"}
 
     @app.get("/api/events")
     async def event_stream(request: Request):

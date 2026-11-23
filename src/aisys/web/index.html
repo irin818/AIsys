@@ -4,107 +4,282 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="aisys-csrf" content="__AISYS_CSRF_TOKEN__" />
-  <title>AIsys · Gemini × Codex 双模型协作室</title>
+  <title>AIsys · 双模型共创工作室</title>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <div class="page">
+  <!-- Living Atmospheric Backdrop (Obsidian-Emerald Bioluminescence) -->
+  <div class="atmosphere" aria-hidden="true">
+    <div class="aurora aurora-a"></div>
+    <div class="aurora aurora-b"></div>
+    <div class="aurora aurora-c"></div>
+    <div class="micro-grid"></div>
+    <canvas id="ambient-canvas"></canvas>
+    <div class="vignette"></div>
+  </div>
+
+  <div class="app-shell">
+    <!-- Minimalist Top HUD -->
     <header class="topbar">
       <div class="topbar-left">
-        <div class="brand-mark">A</div>
-        <div>
-          <div class="brand-title">AIsys 双模型协作室</div>
-          <div class="brand-sub">Gemini (Antigravity) × Codex · 独立提案 · 互审进化 · 无重叠协同</div>
-        </div>
+        <button class="brand-btn" id="btn-home" title="返回共创首页">
+          <span class="brand-emblem" aria-hidden="true">
+            <svg viewBox="0 0 36 36" fill="none">
+              <circle cx="14.5" cy="18" r="8.5" stroke="url(#bGradA)" stroke-width="1.6"/>
+              <circle cx="21.5" cy="18" r="8.5" stroke="url(#bGradB)" stroke-width="1.6"/>
+              <circle cx="18" cy="18" r="2.2" fill="#08F1D4"/>
+              <defs>
+                <linearGradient id="bGradA" x1="6" y1="9" x2="23" y2="27" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#08F1D4"/><stop offset="1" stop-color="#10B981"/>
+                </linearGradient>
+                <linearGradient id="bGradB" x1="30" y1="9" x2="13" y2="27" gradientUnits="userSpaceOnUse">
+                  <stop stop-color="#6EE7B7"/><stop offset="1" stop-color="#059669"/>
+                </linearGradient>
+              </defs>
+            </svg>
+          </span>
+          <span class="brand-copy">
+            <span class="brand-title">AIsys</span>
+            <span class="brand-sub">Gemini × Codex 共创引擎</span>
+          </span>
+        </button>
       </div>
 
       <div class="topbar-center" id="backend-pills">
-        <span class="pill pill-muted">检测模型状态…</span>
+        <span class="status-chip chip-muted"><span class="pulse-dot"></span>初始化引擎遥测…</span>
       </div>
 
       <div class="topbar-right">
-        <select id="session-select" class="input input-sm" title="切换历史会话">
-          <option value="">+ 新建协作会话</option>
-        </select>
-        <button class="btn btn-secondary btn-sm" id="btn-new-session">+ 新建</button>
-        <button class="btn btn-ghost btn-sm" id="btn-theme" title="切换深色/浅色主题">◐</button>
-        <button class="btn btn-danger-ghost btn-sm" id="btn-stop-service" title="停止 AIsys 本地服务">⏻ 停止</button>
+        <div class="select-wrap">
+          <select id="session-select" class="hud-select" title="切换历史协作会话">
+            <option value="">新共创会话</option>
+          </select>
+          <svg class="select-caret" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M4.5 6.5L8 10L11.5 6.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+
+        <button class="btn btn-ghost btn-sm" id="btn-new-session" title="开启新会话">
+          <svg class="ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 3.25V12.75M3.25 8H12.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+          <span>新建</span>
+        </button>
+
+        <button class="btn btn-icon" id="btn-theme" title="切换黑绿极光 / 浅玉主题" aria-label="切换主题">
+          <svg class="ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M13.2 9.8A5.5 5.5 0 0 1 6.2 2.8a5.5 5.5 0 1 0 7 7Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+          </svg>
+        </button>
+
+        <button class="btn btn-icon btn-danger-subtle" id="btn-stop-service" title="停止 AIsys 本地服务" aria-label="停止服务">
+          <svg class="ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M8 2.5V7.5M5 4.3A5.25 5.25 0 1 0 11 4.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>
     </header>
 
-    <main class="container">
-      <!-- NEW SESSION LAUNCHER -->
-      <section class="card hero-card" id="composer-section">
-        <div class="hero-head">
-          <div>
-            <h1>你想让 Gemini 和 Codex 一起完成什么？</h1>
-            <p class="muted">先各自独立提案 → 交叉互审并给出无重叠分工 → 你来拍板或融合微调 → 双方按互斥权限协同完成并互相审查。</p>
+    <main class="stage-shell">
+      <!-- ==================== HOME / CLAUDE-STYLE COMPOSER ==================== -->
+      <section class="composer-view" id="composer-section">
+        <div class="hero-intro">
+          <div class="hero-eyebrow">
+            <span class="pulse-dot dot-live"></span>
+            <span>DUAL-MODEL CO-CREATION STUDIO</span>
           </div>
-          <div class="mode-switch" role="group" aria-label="协作模式">
-            <button class="mode-btn active" data-mode="dev">💻 开发任务</button>
-            <button class="mode-btn" data-mode="learn">📚 学习与研究（输出 Markdown 文档）</button>
+          <h1 class="hero-headline">让两个模型同频思辨，由你定调方向</h1>
+          <p class="hero-lead">
+            独立起草方案、彼此挑刺进化、机械校验零重叠分工、按文件写锁协同交付，并全程透视真实后台执行。
+          </p>
+        </div>
+
+        <div class="composer-card glass-surface spotlight-card">
+          <div class="composer-top">
+            <div class="mode-segmented" role="group" aria-label="协作模式">
+              <button type="button" class="mode-btn active" data-mode="dev">
+                <svg class="ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M5.5 4.5L2 8l3.5 3.5M10.5 4.5L14 8l-3.5 3.5M9 3.5L7 12.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>开发协作</span>
+              </button>
+              <button type="button" class="mode-btn" data-mode="learn">
+                <svg class="ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M2.75 3.5h3.75A2 2 0 0 1 8.5 5.5v7.25a1.5 1.5 0 0 0-1.5-1.5H2.75V3.5Zm10.5 0H9.5a2 2 0 0 0-2 2v7.25a1.5 1.5 0 0 1 1.5-1.5h4.25V3.5Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+                </svg>
+                <span>深度研学 · Markdown 指南</span>
+              </button>
+            </div>
+
+            <button type="button" class="btn btn-ghost btn-xs" id="btn-toggle-project">
+              <svg class="ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M2.5 4.5A1.5 1.5 0 0 1 4 3h2.4l1.3 1.5H12A1.5 1.5 0 0 1 13.5 6v5.5A1.5 1.5 0 0 1 12 13H4a1.5 1.5 0 0 1-1.5-1.5v-7Z" stroke="currentColor" stroke-width="1.35" stroke-linejoin="round"/>
+              </svg>
+              <span>关联本地仓库</span>
+            </button>
+          </div>
+
+          <textarea id="task-input" class="composer-textarea" rows="4"
+            placeholder="描述你想共同完成的开发目标或想要彻底学透的知识主题……（⌘ + Enter 直接启动）"></textarea>
+
+          <div class="project-drawer hidden" id="project-row">
+            <div class="project-input-group">
+              <input type="text" id="project-input" class="field-input"
+                placeholder="输入本地 Git 项目绝对路径（仅读取已提交 HEAD 快照，绝不触碰原工作区）" />
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-validate-project">校验快照</button>
+            </div>
+            <div id="project-hint" class="field-hint"></div>
+          </div>
+
+          <div class="composer-footer">
+            <div class="composer-meta">
+              <span class="meta-tag"><span class="mini-dot mint"></span>Gemini · Antigravity 一键联动</span>
+              <span class="meta-tag"><span class="mini-dot emerald"></span>Codex · 后台沙箱自动推演</span>
+            </div>
+            <button type="button" class="btn btn-primary btn-launch" id="btn-create-session">
+              <span>启动双模型推演</span>
+              <svg class="ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M3.5 8h9M9 4.25L12.75 8 9 11.75" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
           </div>
         </div>
 
-        <textarea id="task-input" class="input hero-textarea" rows="4"
-          placeholder="例如：帮我深入搞懂 Rust 的所有权、借用检查与生命周期，并给出对比图、可运行代码案例和常见避坑练习…"></textarea>
+        <!-- Subtle Inspiration Prompts & Recent Sessions -->
+        <div class="quick-prompts" id="quick-prompts">
+          <button type="button" class="prompt-chip" data-mode="learn" data-prompt="帮我从底层原理到实战避坑彻底学透 Rust 的所有权、借用检查与生命周期，并配有对比案例与可运行练习代码">
+            <span class="chip-kicker">研学</span>
+            <span>彻底学透 Rust 所有权与生命周期</span>
+          </button>
+          <button type="button" class="prompt-chip" data-mode="learn" data-prompt="系统梳理 Python 异步编程 asyncio 事件循环、协程调度与并发陷阱，产出可直接运行的示例和速查清单">
+            <span class="chip-kicker">研学</span>
+            <span>深入 Python asyncio 调度内核</span>
+          </button>
+          <button type="button" class="prompt-chip" data-mode="dev" data-prompt="设计并实现一个带令牌桶限流与熔断保护的轻量 Python HTTP 重试客户端，附带完整单元测试与边界校验">
+            <span class="chip-kicker">开发</span>
+            <span>限流 + 熔断 Python 重试客户端</span>
+          </button>
+        </div>
 
-        <div class="hero-footer">
-          <div class="project-row" id="project-row">
-            <input type="text" id="project-input" class="input input-sm"
-              placeholder="可选：目标 Git 项目绝对路径（仅读取已提交 HEAD 构建隔离副本，不改原仓库）" />
-            <button type="button" class="btn btn-secondary btn-sm" id="btn-validate-project">校验目录</button>
-            <span id="project-hint" class="muted small"></span>
-          </div>
-          <button class="btn btn-primary btn-lg" id="btn-create-session">✦ 开始双模型分析</button>
+        <div class="recent-strip hidden" id="recent-strip">
+          <div class="recent-label">近期会话</div>
+          <div class="recent-list" id="recent-list"></div>
         </div>
       </section>
 
-      <!-- ACTIVE SESSION WORKSPACE -->
-      <section id="session-section" class="hidden">
-        <!-- Session Title & Actions -->
-        <div class="session-header card">
-          <div class="session-meta">
-            <div class="inline-row">
-              <span class="pill" id="s-mode-badge">开发任务</span>
-              <span class="pill" id="s-stage-badge">阶段 1</span>
-              <span class="mono muted small" id="s-id-label"></span>
+      <!-- ==================== ACTIVE SESSION STUDIO ==================== -->
+      <section class="workspace-view hidden" id="session-section">
+        <!-- Session Title & Real-Time Metrics Header -->
+        <div class="session-banner glass-surface spotlight-card">
+          <div class="session-banner-main">
+            <div class="badge-row">
+              <span class="pill pill-mode" id="s-mode-badge">开发协作</span>
+              <span class="pill pill-stage" id="s-stage-badge">阶段 1</span>
+              <span class="mono-id" id="s-id-label"></span>
             </div>
             <h2 id="s-task-title" class="session-title"></h2>
           </div>
-          <div class="inline-row">
-            <button class="btn btn-secondary btn-sm" id="btn-trigger-codex" title="触发/重试 Codex 就绪步骤">↻ 运行 Codex</button>
-            <button class="btn btn-danger-ghost btn-sm" id="btn-cancel-session">取消会话</button>
+
+          <div class="session-banner-right">
+            <div class="kpi-strip" id="s-kpi-strip"></div>
+            <div class="action-cluster">
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-trigger-codex" title="触发或重试就绪的 Codex 后台步骤">
+                <svg class="ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M13 8a5 5 0 1 1-1.3-3.35M13 3.25v2.6h-2.6" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>运行 Codex</span>
+              </button>
+              <button type="button" class="btn btn-ghost btn-sm btn-danger-text" id="btn-cancel-session">取消会话</button>
+            </div>
           </div>
         </div>
 
-        <!-- 5-Step Progress Stepper -->
-        <ol class="stepper" id="stepper">
-          <li data-step="1"><span class="step-num">1</span><span>独立初案</span></li>
-          <li data-step="2"><span class="step-num">2</span><span>交叉互审与分工</span></li>
-          <li data-step="3"><span class="step-num">3</span><span>你的拍板</span></li>
-          <li data-step="4"><span class="step-num">4</span><span>互斥协同执行</span></li>
-          <li data-step="5"><span class="step-num">5</span><span>互相监督交付</span></li>
+        <!-- Living 5-Stage Pipeline Stepper -->
+        <ol class="pipeline-rail" id="stepper">
+          <li data-step="1">
+            <span class="pipe-node"><span class="pipe-num">01</span></span>
+            <span class="pipe-text"><strong>独立初案</strong><small>双模型并行起草</small></span>
+          </li>
+          <li data-step="2">
+            <span class="pipe-node"><span class="pipe-num">02</span></span>
+            <span class="pipe-text"><strong>交叉互审</strong><small>吸收优劣与分工</small></span>
+          </li>
+          <li data-step="3">
+            <span class="pipe-node"><span class="pipe-num">03</span></span>
+            <span class="pipe-text"><strong>拍板融合</strong><small>锁定互斥分工</small></span>
+          </li>
+          <li data-step="4">
+            <span class="pipe-node"><span class="pipe-num">04</span></span>
+            <span class="pipe-text"><strong>协同执行</strong><small>独占写锁推进</small></span>
+          </li>
+          <li data-step="5">
+            <span class="pipe-node"><span class="pipe-num">05</span></span>
+            <span class="pipe-text"><strong>互审交付</strong><small>交叉质检与归档</small></span>
+          </li>
         </ol>
 
+        <!-- Live Neural Execution Topology (100% Real Backend State) -->
+        <div class="topology-ribbon glass-surface" id="topology-ribbon"></div>
+
         <!-- Error Banner -->
-        <div id="s-error-banner" class="banner banner-error hidden"></div>
+        <div id="s-error-banner" class="alert-banner alert-error hidden"></div>
 
-        <!-- Antigravity Route-1 Guidance Bar (shown when Gemini has pending work) -->
-        <div id="gemini-action-bar" class="card action-bar hidden"></div>
+        <!-- One-Key Antigravity Handshake Bar (shown only when Gemini has ready tasks) -->
+        <div id="gemini-action-bar" class="handshake-bar glass-surface hidden"></div>
 
-        <!-- Dynamic Stage Content -->
+        <!-- Dynamic Stage Workspace -->
         <div id="stage-content" class="stage-content"></div>
       </section>
     </main>
   </div>
 
+  <!-- ==================== FLOATING GLASS KERNEL TELEMETRY DOCK ==================== -->
+  <aside class="kernel-dock" id="kernel-dock" data-open="false">
+    <div class="kernel-dock-bar" id="kernel-dock-toggle" role="button" tabindex="0" aria-expanded="false">
+      <div class="kernel-bar-left">
+        <span class="kernel-led" id="kernel-led"></span>
+        <span class="kernel-label">KERNEL TRACE</span>
+        <span class="kernel-ticker" id="kernel-ticker">实时遥测已就绪 · 监听本地内核事件流</span>
+      </div>
+      <div class="kernel-bar-right">
+        <span class="kernel-stat mono" id="kernel-stat-tokens">0 tok</span>
+        <span class="kernel-stat mono" id="kernel-stat-locks">LOCK 0✓ 0✕</span>
+        <span class="kernel-stat mono" id="kernel-stat-count">0 事件</span>
+        <span class="kernel-chevron" aria-hidden="true">
+          <svg class="ico" viewBox="0 0 16 16" fill="none">
+            <path d="M4.5 9.75L8 6.25L11.5 9.75" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </span>
+      </div>
+    </div>
+
+    <div class="kernel-drawer" id="kernel-drawer">
+      <div class="kernel-drawer-head">
+        <div class="kernel-filters" id="kernel-filters" role="tablist">
+          <button type="button" class="kfilter active" data-cat="all">全部事件</button>
+          <button type="button" class="kfilter" data-cat="codex">Codex 进程流</button>
+          <button type="button" class="kfilter" data-cat="gemini">Gemini 通道</button>
+          <button type="button" class="kfilter" data-cat="engine">状态机跃迁</button>
+          <button type="button" class="kfilter" data-cat="lock">防重叠与写锁</button>
+          <button type="button" class="kfilter" data-cat="workspace">沙箱与产物</button>
+        </div>
+        <div class="kernel-drawer-meta" id="kernel-drawer-meta">真实后台内核日志 · SQLite/NDJSON 持久化</div>
+      </div>
+
+      <div class="kernel-stream" id="kernel-stream"></div>
+    </div>
+  </aside>
+
   <!-- MODAL -->
   <div class="modal-backdrop hidden" id="modal-backdrop">
-    <div class="modal-dialog" role="dialog" aria-modal="true">
+    <div class="modal-dialog glass-surface" role="dialog" aria-modal="true">
       <div class="modal-header">
-        <h3 id="modal-title">确认</h3>
-        <button class="btn btn-ghost btn-sm" id="modal-close">✕</button>
+        <h3 id="modal-title">确认操作</h3>
+        <button type="button" class="btn btn-icon" id="modal-close" aria-label="关闭">
+          <svg class="ico" viewBox="0 0 16 16" fill="none">
+            <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>
       <div class="modal-body" id="modal-body"></div>
       <div class="modal-footer" id="modal-footer"></div>

@@ -5,6 +5,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -47,8 +48,44 @@ def stop_group(process: subprocess.Popen) -> None:
     process.wait()
 
 
-def run_process(argv: list[str], cwd: Path, env: dict[str, str], timeout: float,
-                prompt: str = "") -> ProcessResult:
+def _drain_stdout_lines(
+    fd: int,
+    cursor: int,
+    pending: bytes,
+    callback: Callable[[str], None],
+    *,
+    flush_tail: bool = False,
+) -> tuple[int, bytes]:
+    total = min(os.fstat(fd).st_size, OUTPUT_LIMIT)
+    if total > cursor:
+        chunk = os.pread(fd, total - cursor, cursor)
+        cursor += len(chunk)
+        pending += chunk
+    while b"\n" in pending:
+        raw_line, pending = pending.split(b"\n", 1)
+        try:
+            callback(raw_line.decode(errors="replace"))
+        except Exception:
+            pass
+    if flush_tail and pending:
+        try:
+            callback(pending.decode(errors="replace"))
+        except Exception:
+            pass
+        pending = b""
+    return cursor, pending
+
+
+def run_process(
+    argv: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    timeout: float,
+    prompt: str = "",
+    *,
+    on_start: Callable[[int], None] | None = None,
+    on_stdout_line: Callable[[str], None] | None = None,
+) -> ProcessResult:
     started = time.monotonic()
     issue = ""
     with (
@@ -67,8 +104,19 @@ def run_process(argv: list[str], cwd: Path, env: dict[str, str], timeout: float,
             return ProcessResult(issue="unavailable")
         except OSError:
             return ProcessResult(issue="failed")
+        if on_start is not None:
+            try:
+                on_start(child.pid)
+            except Exception:
+                pass
+        cursor = 0
+        pending = b""
         try:
             while True:
+                if on_stdout_line is not None:
+                    cursor, pending = _drain_stdout_lines(
+                        stdout.fileno(), cursor, pending, on_stdout_line
+                    )
                 size = os.fstat(stdout.fileno()).st_size + os.fstat(stderr.fileno()).st_size
                 if PROCESS_INTERRUPTED.is_set():
                     issue = "interrupted"
@@ -85,6 +133,10 @@ def run_process(argv: list[str], cwd: Path, env: dict[str, str], timeout: float,
         finally:
             # The main process can exit while descendants keep running.
             stop_group(child)
+        if on_stdout_line is not None:
+            _drain_stdout_lines(
+                stdout.fileno(), cursor, pending, on_stdout_line, flush_tail=True
+            )
         stdout.seek(0)
         stderr.seek(0)
         return ProcessResult(
